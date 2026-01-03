@@ -31,8 +31,19 @@ from Autodesk.Revit.UI import TaskDialog, TaskDialogCommonButtons, TaskDialogRes
 from Autodesk.Revit.Exceptions import InvalidOperationException
 
 import sys
+import os
 from collections import defaultdict
 from System.Collections.Generic import List
+from Autodesk.Revit.DB import BasicFileInfo
+
+# ensure local modules are importable
+_here = os.path.dirname(__file__)
+_parent = os.path.dirname(_here)
+for _p in (_here, _parent):
+    if _p not in sys.path:
+        sys.path.append(_p)
+
+import module_state
 
 app = __revit__.Application
 uidoc = __revit__.ActiveUIDocument
@@ -134,6 +145,15 @@ def bbox_center(elem, view):
         (bb.Min.Y + bb.Max.Y) * 0.5,
         (bb.Min.Z + bb.Max.Z) * 0.5,
     )
+
+
+def normalize_category(cat):
+    if not cat:
+        return ("<None>", -1)
+    name = (cat.Name or "").strip()
+    # collapse casing differences (Center line vs Center Line)
+    norm_name = name.title()
+    return (norm_name, cat.Id.IntegerValue)
 
 
 def try_temp_isolate(doc, view, ids):
@@ -261,7 +281,10 @@ def main():
     outside = 0
     hidden = 0
     category_counts = defaultdict(int)
+    category_counts_by_id = defaultdict(int)
+    category_name_by_id = {}
     outside_by_cat = defaultdict(int)
+    outside_by_cat_id = defaultdict(int)
 
     inside = []
     for e in elems:
@@ -286,52 +309,99 @@ def main():
                 and ctr.Y <= bb.Max.Y
             ):
                 inside.append(e)
-                if e.Category:
-                    category_counts[e.Category.Name] += 1
+                cname, cid = normalize_category(e.Category)
+                category_counts[cname] += 1
+                category_counts_by_id[cid] += 1
+                if cid not in category_name_by_id:
+                    category_name_by_id[cid] = cname
             else:
                 outside += 1
-                if e.Category:
-                    outside_by_cat[e.Category.Name] += 1
+                cname, cid = normalize_category(e.Category)
+                outside_by_cat[cname] += 1
+                outside_by_cat_id[cid] += 1
+                if cid not in category_name_by_id:
+                    category_name_by_id[cid] = cname
         elif kind == "polygon":
             if is_point_inside_polygon(ctr, shape):
                 inside.append(e)
-                if e.Category:
-                    category_counts[e.Category.Name] += 1
+                cname, cid = normalize_category(e.Category)
+                category_counts[cname] += 1
+                category_counts_by_id[cid] += 1
+                if cid not in category_name_by_id:
+                    category_name_by_id[cid] = cname
             else:
                 outside += 1
-                if e.Category:
-                    outside_by_cat[e.Category.Name] += 1
+                cname, cid = normalize_category(e.Category)
+                outside_by_cat[cname] += 1
+                outside_by_cat_id[cid] += 1
+                if cid not in category_name_by_id:
+                    category_name_by_id[cid] = cname
 
-    payload = {
-        "view": {"id": view.Id.IntegerValue, "name": view.Name},
+    core_payload = {
+        "view": {
+            "id": view.Id.IntegerValue,
+            "name": view.Name,
+            "type": str(view.ViewType),
+        },
         "region": {
-            "method": "scope_box" if kind == "scopebox" else "detail_lines",
-            "bbox": (
-                {
-                    "min": (shape.Min.X, shape.Min.Y, shape.Min.Z),
-                    "max": (shape.Max.X, shape.Max.Y, shape.Max.Z),
-                }
-                if kind == "scopebox"
-                else None
+            "method": "SECTION_BOX" if kind == "scopebox" else "DETAIL_LINES",
+            "bbox_min": (
+                (shape.Min.X, shape.Min.Y, shape.Min.Z) if kind == "scopebox" else None
             ),
-            "polygon": [(p.X, p.Y, p.Z) for p in shape] if kind == "polygon" else None,
+            "bbox_max": (
+                (shape.Max.X, shape.Max.Y, shape.Max.Z) if kind == "scopebox" else None
+            ),
+            "polygon_xyz": (
+                [(p.X, p.Y, p.Z) for p in shape] if kind == "polygon" else None
+            ),
             "boundary_ids": (
                 [bid.IntegerValue for bid in boundary_ids] if boundary_ids else []
             ),
+            "view_crop_transform": {
+                "origin": (
+                    view.CropBox.Transform.Origin.X,
+                    view.CropBox.Transform.Origin.Y,
+                    view.CropBox.Transform.Origin.Z,
+                ),
+                "basisX": (
+                    view.CropBox.Transform.BasisX.X,
+                    view.CropBox.Transform.BasisX.Y,
+                    view.CropBox.Transform.BasisX.Z,
+                ),
+                "basisY": (
+                    view.CropBox.Transform.BasisY.X,
+                    view.CropBox.Transform.BasisY.Y,
+                    view.CropBox.Transform.BasisY.Z,
+                ),
+                "basisZ": (
+                    view.CropBox.Transform.BasisZ.X,
+                    view.CropBox.Transform.BasisZ.Y,
+                    view.CropBox.Transform.BasisZ.Z,
+                ),
+            },
         },
         "elements": {
             "ids": [e.Id.IntegerValue for e in inside],
             "by_category": dict(category_counts),
+            "by_category_id": dict(category_counts_by_id),
+            "category_name_by_id": category_name_by_id,
         },
-        "exclusions": {
+        "diagnostics": {
+            "scanned_total": total_candidates,
+            "selected": len(inside),
             "no_bbox": no_bbox,
             "outside_region": outside,
             "hidden": hidden,
             "boundary": len(boundary_ids) if kind == "polygon" else 0,
+            "outside_by_category": dict(outside_by_cat),
+            "outside_by_category_id": dict(outside_by_cat_id),
         },
     }
 
-    msg = "Found {} element(s) in region.".format(len(payload["elements"]["ids"]))
+    payload = module_state.to_payload(doc, core_payload)
+
+    selected_ids = core_payload["elements"]["ids"]
+    msg = "Found {} element(s) in region.".format(len(selected_ids))
     print(msg)
 
     if DIAGNOSTICS:
@@ -356,10 +426,12 @@ def main():
         )[:15]:
             print("    {}: {}".format(cat, cnt))
 
-    if payload["elements"]["ids"]:
-        ids_to_select = List[ElementId](
-            [ElementId(i) for i in payload["elements"]["ids"]]
-        )
+    # Persist payload
+    saved_path = module_state.save_payload(doc, payload)
+    print("Saved state: {}".format(saved_path))
+
+    if selected_ids:
+        ids_to_select = List[ElementId]([ElementId(i) for i in selected_ids])
         if TEMP_ISOLATE:
             if try_temp_isolate(doc, view, ids_to_select):
                 uidoc.Selection.SetElementIds(ids_to_select)
