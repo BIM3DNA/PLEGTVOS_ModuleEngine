@@ -7,6 +7,7 @@ The tool scans a defined module region (scope box or bounding area), snapshots v
 It replaces error-prone copy/mirror workflows with a controlled, repeatable module system suitable for prefab and industrialized housing.
 
 ## Key Capabilities
+
 - Capture installation modules from a defined region
 - Save and manage versioned module states
 - Re-instantiate modules at new locations using reference geometry
@@ -16,14 +17,17 @@ It replaces error-prone copy/mirror workflows with a controlled, repeatable modu
 - pyRevit + WPF based production-grade tool
 
 ## Status
+
 🚧 Early development – architecture & core engine in progress
 
 ## Tech Stack
+
 - Revit API (2022+)
 - pyRevit (CPython)
 - WPF (XAML)
 - Modular Python architecture
 
 ## Disclaimer
+
 This repository contains a generalized automation engine concept.
 Project-specific logic, datasets, and client configurations are not included.
