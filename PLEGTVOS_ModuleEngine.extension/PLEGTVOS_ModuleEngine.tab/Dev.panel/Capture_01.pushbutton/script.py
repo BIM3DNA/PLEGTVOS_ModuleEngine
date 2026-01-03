@@ -31,10 +31,18 @@ from Autodesk.Revit.UI import TaskDialog, TaskDialogCommonButtons, TaskDialogRes
 from Autodesk.Revit.Exceptions import InvalidOperationException
 
 import sys
+from collections import defaultdict
+from System.Collections.Generic import List
 
 app = __revit__.Application
 uidoc = __revit__.ActiveUIDocument
 doc = uidoc.Document
+
+DIAGNOSTICS = True  # toggle verbose diagnostics
+TEMP_ISOLATE = True  # toggle temporary isolate after scan
+ALT_ISOLATE_HIDE_OTHER = (
+    False  # last-resort: hide all others in view (persisting until reset)
+)
 
 
 # -----------------------------
@@ -128,6 +136,42 @@ def bbox_center(elem, view):
     )
 
 
+def try_temp_isolate(doc, view, ids):
+    """Attempt temporary isolate; return True if succeeded."""
+    try:
+        if hasattr(view, "IsolateElementsTemporary"):
+            view.IsolateElementsTemporary(ids)
+            return True
+    except Exception as ex1:
+        print("Temporary isolate failed (no tx): {}".format(ex1))
+        try:
+            t = Transaction(doc, "Temporary isolate")
+            t.Start()
+            view.IsolateElementsTemporary(ids)
+            t.Commit()
+            return True
+        except Exception as ex2:
+            print("Temporary isolate failed (with tx): {}".format(ex2))
+            if ALT_ISOLATE_HIDE_OTHER:
+                try:
+                    t2 = Transaction(doc, "Hide others (fallback isolate)")
+                    t2.Start()
+                    all_ids = [
+                        e.Id
+                        for e in FilteredElementCollector(doc, view.Id)
+                        .WhereElementIsNotElementType()
+                        .ToElements()
+                        if e.Id not in ids
+                    ]
+                    if all_ids:
+                        view.HideElements(List[ElementId](all_ids))
+                    t2.Commit()
+                    return True
+                except Exception as ex3:
+                    print("Fallback hide-others failed: {}".format(ex3))
+    return False
+
+
 # -----------------------------
 # Region acquisition
 # -----------------------------
@@ -170,7 +214,8 @@ def pick_detail_lines_polygon():
     if not poly:
         TaskDialog.Show("Region Scanner", "Detail lines do not form a closed loop.")
         return None
-    return ("polygon", poly)
+    boundary_ids = [doc.GetElement(r).Id for r in refs]
+    return ("polygon", poly, boundary_ids)
 
 
 def choose_region():
@@ -198,7 +243,12 @@ def main():
     if not region:
         sys.exit("Cancelled.")
 
-    kind, shape = region
+    if region[0] == "scopebox":
+        kind, shape = region
+        boundary_ids = []
+    else:
+        kind, shape, boundary_ids = region
+
     view = uidoc.ActiveView
     elems = (
         FilteredElementCollector(doc, view.Id)
@@ -206,10 +256,26 @@ def main():
         .ToElements()
     )
 
+    total_candidates = len(elems)
+    no_bbox = 0
+    outside = 0
+    hidden = 0
+    category_counts = defaultdict(int)
+    outside_by_cat = defaultdict(int)
+
     inside = []
     for e in elems:
+        if kind == "polygon" and boundary_ids and e.Id in boundary_ids:
+            continue
+        try:
+            if hasattr(view, "IsElementVisible") and not view.IsElementVisible(e.Id):
+                hidden += 1
+                continue
+        except Exception:
+            pass
         ctr = bbox_center(e, view)
         if not ctr:
+            no_bbox += 1
             continue
         if kind == "scopebox":
             bb = shape
@@ -220,18 +286,90 @@ def main():
                 and ctr.Y <= bb.Max.Y
             ):
                 inside.append(e)
+                if e.Category:
+                    category_counts[e.Category.Name] += 1
+            else:
+                outside += 1
+                if e.Category:
+                    outside_by_cat[e.Category.Name] += 1
         elif kind == "polygon":
             if is_point_inside_polygon(ctr, shape):
                 inside.append(e)
+                if e.Category:
+                    category_counts[e.Category.Name] += 1
+            else:
+                outside += 1
+                if e.Category:
+                    outside_by_cat[e.Category.Name] += 1
 
-    msg = "Found {} element(s) in region.".format(len(inside))
+    payload = {
+        "view": {"id": view.Id.IntegerValue, "name": view.Name},
+        "region": {
+            "method": "scope_box" if kind == "scopebox" else "detail_lines",
+            "bbox": (
+                {
+                    "min": (shape.Min.X, shape.Min.Y, shape.Min.Z),
+                    "max": (shape.Max.X, shape.Max.Y, shape.Max.Z),
+                }
+                if kind == "scopebox"
+                else None
+            ),
+            "polygon": [(p.X, p.Y, p.Z) for p in shape] if kind == "polygon" else None,
+            "boundary_ids": (
+                [bid.IntegerValue for bid in boundary_ids] if boundary_ids else []
+            ),
+        },
+        "elements": {
+            "ids": [e.Id.IntegerValue for e in inside],
+            "by_category": dict(category_counts),
+        },
+        "exclusions": {
+            "no_bbox": no_bbox,
+            "outside_region": outside,
+            "hidden": hidden,
+            "boundary": len(boundary_ids) if kind == "polygon" else 0,
+        },
+    }
+
+    msg = "Found {} element(s) in region.".format(len(payload["elements"]["ids"]))
     print(msg)
-    for e in inside:
-        cname = e.Category.Name if e.Category else "NoCategory"
-        name = e.Name if hasattr(e, "Name") else ""
-        print(" - {} | {} | Id {}".format(cname, name, e.Id))
+
+    if DIAGNOSTICS:
+        print("Diagnostics:")
+        print(" - Candidates in view: {}".format(total_candidates))
+        print(" - No bbox: {}".format(no_bbox))
+        print(" - Outside: {}".format(outside))
+        print(" - Hidden: {}".format(hidden))
+        print(
+            " - Boundary excluded: {}".format(
+                len(boundary_ids) if kind == "polygon" else 0
+            )
+        )
+        print(" - By category (top 15):")
+        for cat, cnt in sorted(
+            category_counts.items(), key=lambda x: x[1], reverse=True
+        )[:15]:
+            print("    {}: {}".format(cat, cnt))
+        print(" - Outside by category (top 15):")
+        for cat, cnt in sorted(
+            outside_by_cat.items(), key=lambda x: x[1], reverse=True
+        )[:15]:
+            print("    {}: {}".format(cat, cnt))
+
+    if payload["elements"]["ids"]:
+        ids_to_select = List[ElementId](
+            [ElementId(i) for i in payload["elements"]["ids"]]
+        )
+        if TEMP_ISOLATE:
+            if try_temp_isolate(doc, view, ids_to_select):
+                uidoc.Selection.SetElementIds(ids_to_select)
+            else:
+                uidoc.Selection.SetElementIds(ids_to_select)
+        else:
+            uidoc.Selection.SetElementIds(ids_to_select)
 
     TaskDialog.Show("Region Scanner", msg)
+    return payload
 
 
 if __name__ == "__main__":
