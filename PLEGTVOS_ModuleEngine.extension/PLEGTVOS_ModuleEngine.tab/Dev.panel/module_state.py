@@ -83,6 +83,7 @@ def _is_writable(path):
         os.remove(test_path)
         return True
     except Exception:
+        print("module_state: path not writable -> {}".format(path))
         return False
 
 
