@@ -17,6 +17,7 @@ Writes region_apply_<timestamp>.json and region_apply_latest.json with results.
 
 from Autodesk.Revit.DB import (
     BuiltInCategory,
+    AssemblyInstance,
     ElementId,
     FilteredElementCollector,
     IndependentTag,
@@ -118,11 +119,11 @@ def place_text_note(view, text, corner):
         return False
 
 
-def tag_exists_for_pipe(view, pipe_id):
+def tag_exists(view, host_id, tag_cat):
     try:
         tags = (
             FilteredElementCollector(doc, view.Id)
-            .OfCategory(BuiltInCategory.OST_PipeTags)
+            .OfCategory(tag_cat)
             .WhereElementIsNotElementType()
         )
         for t in tags:
@@ -132,16 +133,16 @@ def tag_exists_for_pipe(view, pipe_id):
                 else [t.TaggedElementId]
             )
             for tid in tagged_ids:
-                if tid and tid.IntegerValue == pipe_id:
+                if tid and tid.IntegerValue == host_id:
                     return True
     except Exception:
         return False
     return False
 
 
-def tag_pipe(view, pipe):
+def tag_element(view, elem, tag_cat, tag_type_id=None, label_text=None):
     try:
-        bb = pipe.get_BoundingBox(view)
+        bb = elem.get_BoundingBox(view)
         if not bb:
             return False
         ctr = XYZ(
@@ -149,8 +150,8 @@ def tag_pipe(view, pipe):
             (bb.Min.Y + bb.Max.Y) * 0.5,
             (bb.Min.Z + bb.Max.Z) * 0.5,
         )
-        ref = Reference(pipe)
-        IndependentTag.Create(
+        ref = Reference(elem)
+        new_tag = IndependentTag.Create(
             doc,
             view.Id,
             ref,
@@ -159,9 +160,78 @@ def tag_pipe(view, pipe):
             TagOrientation.Horizontal,
             ctr,
         )
+        if tag_type_id and new_tag and new_tag.GetTypeId() != tag_type_id:
+            try:
+                new_tag.ChangeTypeId(tag_type_id)
+            except Exception:
+                pass
+        if label_text and new_tag:
+            try:
+                new_tag.TagText = label_text
+            except Exception:
+                pass
         return True
     except Exception:
         return False
+
+
+def find_tag_type(tag_cat, preferred_names=None):
+    preferred_names = preferred_names or []
+    try:
+        types = (
+            FilteredElementCollector(doc)
+            .OfCategory(tag_cat)
+            .WhereElementIsElementType()
+            .ToElements()
+        )
+        # prefer by exact name match
+        for name in preferred_names:
+            for t in types:
+                try:
+                    if (t.Name or "").strip().lower() == name.strip().lower():
+                        return t.Id
+                except Exception:
+                    continue
+        # fallback first available
+        if types:
+            return types[0].Id
+    except Exception:
+        return None
+    return None
+
+
+def fmt_mm(param):
+    if not param:
+        return ""
+    try:
+        val = param.AsDouble()
+        if val is None:
+            return ""
+        return str(int(round(val * 304.8)))
+    except Exception:
+        try:
+            return param.AsValueString() or ""
+        except Exception:
+            return ""
+
+
+def pipe_label(elem, new_code):
+    diam = ""
+    for pname in ("Outside Diameter", "Diameter", "Nominal Diameter"):
+        p = elem.LookupParameter(pname)
+        diam = fmt_mm(p)
+        if diam:
+            break
+    length = fmt_mm(elem.LookupParameter("Length"))
+    parts = [new_code]
+    sub = []
+    if diam:
+        sub.append("\u2300{} mm".format(diam))
+    if length:
+        sub.append("L = {} mm".format(length))
+    if sub:
+        parts.append(" / ".join(sub))
+    return "\n".join(parts)
 
 
 def main():
@@ -184,8 +254,13 @@ def main():
         "text_content": base_code,
         "updated_comments": 0,
         "tag_added": 0,
+        "skipped_grouped": 0,
+        "skipped_group_locked": 0,
+        "skipped_no_tag_family": 0,
+        "skipped_tag_fail": 0,
         "skipped_missing": 0,
         "skipped_no_param": 0,
+        "skipped_already_tagged": 0,
         "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H-%M-%SZ"),
         "view": {"id": view.Id.IntegerValue, "name": view.Name},
     }
@@ -193,25 +268,44 @@ def main():
     t = Transaction(doc, "Apply Region Codes")
     t.Start()
 
+    new_tag_ids = []
+
     if corner and base_code:
         if place_text_note(view, base_code, corner):
             summary["placed_text"] = True
 
-    for r in rows:
-        try:
-            eid = ElementId(int(r.get("Id")))
-        except Exception:
-            continue
+    # tag category mapping
+    TAG_MAP = {
+        int(BuiltInCategory.OST_PipeCurves): BuiltInCategory.OST_PipeTags,
+        int(BuiltInCategory.OST_FlexPipeCurves): BuiltInCategory.OST_FlexPipeTags,
+        int(BuiltInCategory.OST_PipeFitting): BuiltInCategory.OST_PipeFittingTags,
+    }
+    TAG_PREFS = {
+        int(BuiltInCategory.OST_PipeCurves): ["M_Pipe Size Tag"],
+        int(BuiltInCategory.OST_FlexPipeCurves): ["M_Pipe Size Tag"],
+        int(BuiltInCategory.OST_PipeFitting): [
+            "M_Pipe Fitting Tag",
+            "Pipe Fitting Tag",
+        ],
+    }
+    COMMENT_SET_IDS = set(
+        [
+            int(BuiltInCategory.OST_PipeCurves),
+            int(BuiltInCategory.OST_FlexPipeCurves),
+            int(BuiltInCategory.OST_PipeFitting),
+        ]
+    )
+
+    def process_one(eid, new_code, action):
         elem = doc.GetElement(eid)
         if not elem or not elem.IsValidObject:
             summary["skipped_missing"] += 1
-            continue
+            return
 
-        cat = r.get("Category", "")
-        new_code = r.get("NewCode", "") or base_code
+        cat_id = elem.Category.Id.IntegerValue if elem.Category else None
 
-        # set Comments for pipes and fittings
-        if cat in ("Pipes", "Pipe Fittings"):
+        # set Comments
+        if cat_id in COMMENT_SET_IDS:
             p = elem.LookupParameter("Comments")
             if p and not p.IsReadOnly:
                 try:
@@ -222,14 +316,74 @@ def main():
             else:
                 summary["skipped_no_param"] += 1
 
-        # tags only for pipes
-        if cat == "Pipes":
-            action = (r.get("TagAction") or "").lower()
-            if action == "add" and not tag_exists_for_pipe(view, eid.IntegerValue):
-                if tag_pipe(view, elem):
-                    summary["tag_added"] += 1
+        # tags
+        if action == "add" and cat_id in TAG_MAP:
+            tag_cat = TAG_MAP[cat_id]
+            tag_type_id = find_tag_type(tag_cat, TAG_PREFS.get(cat_id, []))
+            if not tag_type_id:
+                summary["skipped_no_tag_family"] += 1
+                return
+            if tag_exists(view, eid.IntegerValue, tag_cat):
+                summary["skipped_already_tagged"] += 1
+            else:
+                try:
+                    label_text = pipe_label(elem, new_code)
+                    if tag_element(view, elem, tag_cat, tag_type_id, label_text):
+                        summary["tag_added"] += 1
+                        try:
+                            tags = (
+                                FilteredElementCollector(doc, view.Id)
+                                .OfCategory(tag_cat)
+                                .WhereElementIsNotElementType()
+                            )
+                            newest = max(
+                                tags, key=lambda x: x.Id.IntegerValue, default=None
+                            )
+                            if newest:
+                                new_tag_ids.append(newest.Id)
+                        except Exception:
+                            pass
+                    else:
+                        summary["skipped_tag_fail"] += 1
+                except Exception:
+                    summary["skipped_tag_fail"] += 1
+
+    for r in rows:
+        try:
+            eid = ElementId(int(r.get("Id")))
+        except Exception:
+            continue
+
+        new_code = r.get("NewCode", "") or base_code
+        action = (r.get("TagAction") or "").lower()
+        elem = doc.GetElement(eid)
+        if not elem or not elem.IsValidObject:
+            summary["skipped_missing"] += 1
+            continue
+
+        # expand assemblies to their members, otherwise process the element
+        if isinstance(elem, AssemblyInstance):
+            try:
+                mem_ids = elem.GetMemberIds()
+                for mid in mem_ids:
+                    process_one(mid, new_code, action or "add")
+            except Exception:
+                summary["skipped_tag_fail"] += 1
+        else:
+            # attempt processing even if grouped; count grouped separately on failure
+            try:
+                process_one(eid, new_code, action)
+            except Exception:
+                summary["skipped_group_locked"] += 1
 
     t.Commit()
+
+    # Highlight new tags (best-effort)
+    try:
+        if new_tag_ids:
+            uidoc.Selection.SetElementIds(List[ElementId](new_tag_ids))
+    except Exception:
+        pass
 
     state_dir, _loc = module_state.get_state_dir(doc)
     if not os.path.isdir(state_dir):
@@ -248,15 +402,25 @@ def main():
         "Base code: {0}\n"
         "Comments updated: {1}\n"
         "Tags added: {2}\n"
-        "Missing elements: {3}\n"
-        "Missing writable param: {4}\n"
-        "Text note placed: {5}\n"
-        "Saved: {6}".format(
+        "Skipped grouped: {3}\n"
+        "Already tagged: {4}\n"
+        "Missing elements: {5}\n"
+        "Missing writable param: {6}\n"
+        "No tag family: {7}\n"
+        "Tag failures: {8}\n"
+        "Group locked (errors): {9}\n"
+        "Text note placed: {10}\n"
+        "Saved: {11}".format(
             base_code,
             summary["updated_comments"],
             summary["tag_added"],
+            summary["skipped_grouped"],
+            summary["skipped_already_tagged"],
             summary["skipped_missing"],
             summary["skipped_no_param"],
+            summary["skipped_no_tag_family"],
+            summary["skipped_tag_fail"],
+            summary["skipped_group_locked"],
             "Yes" if summary["placed_text"] else "No",
             latest_path,
         ),

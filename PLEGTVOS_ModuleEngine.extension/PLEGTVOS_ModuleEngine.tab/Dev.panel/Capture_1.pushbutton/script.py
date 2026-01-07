@@ -158,26 +158,61 @@ def calc_center(elem, view):
 
 
 def auto_number(elements, base_code):
-    # elements: list of dict; mutate NewCode for pipes and tags; fittings = base
+    # elements: list of dict; mutate NewCode for pipes/flex pipes and tags; fittings = base
+    # numbering scheme: base_code + "." + each digit of the index separated by dots (e.g. idx=10 -> ".1.0")
     pipes = []
+    # normalize base (strip leading "prefab ")
+    base_num = re.search(r"([\d\.]+)", base_code)
+    base_val = base_num.group(1) if base_num else base_code
+
     for ed in elements:
-        if ed["Category"] == "Pipes":
+        if ed["Category"] in ("Pipes", "Flex Pipes"):
             ctr = ed.get("_center")
             pipes.append((ctr[0] if ctr else 0, ctr[1] if ctr else 0, ed))
         elif ed["Category"] == "Pipe Fittings":
-            ed["NewCode"] = base_code
+            ed["NewCode"] = base_val
+        else:
+            # reset others to base as well
+            ed["NewCode"] = base_val
     pipes.sort(key=lambda x: (x[0], x[1]))
     for idx, (_, _, ed) in enumerate(pipes, 1):
-        ed["NewCode"] = "{}.{}".format(base_code, idx)
+        idx_str = ".".join(list(str(idx)))
+        ed["NewCode"] = "{}.{}".format(base_val, idx_str)
     # mirror tags to pipe order
     tag_idx = 1
     for _, _, ed in pipes:
         for other in elements:
-            if other["Category"] == "Pipe Tags" and tag_idx == int(
-                ed["NewCode"].split(".")[-1]
-            ):
-                other["NewCode"] = ed["NewCode"]
+            if other["Category"] == "Pipe Tags":
+                # align tag index with pipe index
+                idx_str = ".".join(list(str(tag_idx)))
+                other["NewCode"] = "{}.{}".format(base_val, idx_str)
         tag_idx += 1
+
+
+def fmt_len_mm(param):
+    if not param:
+        return ""
+    try:
+        val = param.AsDouble()
+        if val is None:
+            return ""
+        mm = val * 304.8
+        return "{} mm".format(int(round(mm)))
+    except Exception:
+        try:
+            return param.AsValueString() or ""
+        except Exception:
+            return ""
+
+
+def fmt_diam_mm(elem):
+    for pname in ("Outside Diameter", "Diameter", "Nominal Diameter"):
+        p = elem.LookupParameter(pname)
+        if p:
+            s = fmt_len_mm(p)
+            if s:
+                return s
+    return ""
 
 
 class ReviewForm(Form):
@@ -280,6 +315,9 @@ class ReviewForm(Form):
         add_col("Name", "Name")
         add_col("DefaultCode", "Default Code")
         add_col("NewCode", "New Code", readonly=False)
+        add_col("Outside", "Outside")
+        add_col("Length", "Length")
+        add_col("Size", "Size")
         add_col("TagAction", "Tag Action", readonly=False)
         self.grid.Columns.AddRange(Array[DataGridViewColumn](cols))
 
@@ -291,6 +329,9 @@ class ReviewForm(Form):
             row.Cells["Name"].Value = r["Name"]
             row.Cells["DefaultCode"].Value = r["DefaultCode"]
             row.Cells["NewCode"].Value = r["NewCode"]
+            row.Cells["Outside"].Value = r.get("Outside", "")
+            row.Cells["Length"].Value = r.get("Length", "")
+            row.Cells["Size"].Value = r.get("Size", "")
             row.Cells["TagAction"].Value = r.get("TagAction", "")
 
         self.rows = rows
@@ -301,11 +342,9 @@ class ReviewForm(Form):
             MessageBox.Show("Enter a base code first.")
             return
         auto_number(self.rows, base)
-        # refresh grid values
+        # refresh grid values (all rows)
         for i, r in enumerate(self.rows):
             self.grid.Rows[i].Cells["NewCode"].Value = r["NewCode"]
-            if r["Category"] == "Pipe Tags" and "NewCode" in r:
-                self.grid.Rows[i].Cells["NewCode"].Value = r["NewCode"]
 
     def on_ok(self, sender, event):
         base = self.baseBox.Text.strip()
@@ -374,26 +413,39 @@ def main():
         name = elem.Name if hasattr(elem, "Name") else ""
         default = get_comments(elem)
         center = calc_center(elem, target_view)
+        outside = fmt_diam_mm(elem)
+        length_val = fmt_len_mm(elem.LookupParameter("Length"))
+        size_val = ""
         tag_action = ""
-        if cat_name == "Pipes":
+        if cat_name in ("Pipes", "Flex Pipes"):
             # basic default: if there is a tag in view, keep; else add
-            has_tag = any(
-                isinstance(t, object)
-                for t in FilteredElementCollector(doc, target_view.Id)
-                .OfCategory(BuiltInCategory.OST_PipeTags)
-                .WhereElementIsNotElementType()
-                if any(
-                    (tid.IntegerValue == eid.IntegerValue)
-                    for tid in (
-                        t.GetTaggedElementIds()
-                        if hasattr(t, "GetTaggedElementIds")
-                        else [t.TaggedElementId]
+            try:
+                tag_cat = (
+                    BuiltInCategory.OST_PipeTags
+                    if cat_name == "Pipes"
+                    else BuiltInCategory.OST_FlexPipeTags
+                )
+                has_tag = any(
+                    isinstance(t, object)
+                    for t in FilteredElementCollector(doc, target_view.Id)
+                    .OfCategory(tag_cat)
+                    .WhereElementIsNotElementType()
+                    if any(
+                        (tid.IntegerValue == eid.IntegerValue)
+                        for tid in (
+                            t.GetTaggedElementIds()
+                            if hasattr(t, "GetTaggedElementIds")
+                            else [t.TaggedElementId]
+                        )
                     )
                 )
-            )
-            tag_action = "keep" if has_tag else "add"
-        elif cat_name == "Pipe Tags":
+                tag_action = "keep" if has_tag else "add"
+            except Exception:
+                tag_action = "add"
+        elif cat_name in ("Pipe Tags", "Flex Pipe Tags"):
             tag_action = "keep"
+        elif cat_name == "Pipe Fittings":
+            tag_action = "add"
 
         rows.append(
             {
@@ -402,6 +454,9 @@ def main():
                 "Name": name,
                 "DefaultCode": default,
                 "NewCode": default,
+                "Outside": outside,
+                "Length": length_val,
+                "Size": size_val,
                 "TagAction": tag_action,
                 "_center": center,
             }
