@@ -382,6 +382,11 @@ def main():
             skipped_bad += 1
             skipped_details.append((i.IntegerValue, "no category", "<None>"))
             continue
+        # skip systems explicitly (non-physical)
+        cname = cat_name(e)
+        if cname in ("Piping Systems", "Duct Systems"):
+            skipped_details.append((i.IntegerValue, "system skipped", cname))
+            continue
         idlist.Add(i)
 
     # add assembly instances (unique)
@@ -394,6 +399,9 @@ def main():
     views_copied = 0
     views_failed = 0
     copy_failed_ids = ClrList[ElementId]()
+    fail_by_cat = {}
+    system_cats = {"Piping Systems", "Duct Systems"}
+    mapping_pairs = []  # (source_id, new_id)
 
     t = Transaction(doc, "Transform Engine Copy")
     try:
@@ -401,7 +409,11 @@ def main():
         if idlist.Count > 0:
             try:
                 new_ids = ElementTransformUtils.CopyElements(doc, idlist, doc, xf, opt)
-                copied = len(list(new_ids))
+                new_list = list(new_ids)
+                copied = len(new_list)
+                if len(new_list) == idlist.Count:
+                    for idx, sid in enumerate(idlist):
+                        mapping_pairs.append((sid, new_list[idx]))
             except Exception:
                 # fallback: copy one by one
                 copied = 0
@@ -412,14 +424,19 @@ def main():
                         res = ElementTransformUtils.CopyElements(
                             doc, solo, doc, xf, opt
                         )
-                        copied += len(list(res))
+                        res_list = list(res)
+                        copied += len(res_list)
+                        if len(res_list) == 1:
+                            mapping_pairs.append((eid, res_list[0]))
                     except Exception:
                         skipped_bad += 1
                         copy_failed_ids.Add(eid)
                         try:
                             e = doc.GetElement(eid)
+                            cname = cat_name(e)
+                            fail_by_cat.setdefault(cname, []).append(eid)
                             skipped_details.append(
-                                (eid.IntegerValue, "copy fail", cat_name(e))
+                                (eid.IntegerValue, "copy fail", cname)
                             )
                         except Exception:
                             pass
@@ -436,6 +453,35 @@ def main():
                 vs_failed = vs_ids.Count
         elif vs_ids.Count > 0:
             vs_failed = vs_ids.Count
+        # retry specific categories with pure translation if rotation ~0
+        if abs(angle) < 1e-6 and fail_by_cat:
+            retry_cats = ["Center line", "Center Line"]
+            for catlabel in retry_cats:
+                ids_for_cat = fail_by_cat.get(catlabel, [])
+                if not ids_for_cat:
+                    continue
+                try:
+                    rl = ClrList[ElementId]()
+                    for rid in ids_for_cat:
+                        rl.Add(rid)
+                    trans_res = ElementTransformUtils.CopyElements(
+                        uidoc.ActiveView, rl, xf.Origin
+                    )
+                    count_new = len(list(trans_res))
+                    if count_new:
+                        copied += count_new
+                        # clear these failures from bookkeeping
+                        for rid in ids_for_cat:
+                            if rid in copy_failed_ids:
+                                copy_failed_ids.Remove(rid)
+                        # remove from skipped_details
+                        skipped_details = [
+                            sd
+                            for sd in skipped_details
+                            if not (sd[1] == "copy fail" and sd[2] == catlabel)
+                        ]
+                except Exception:
+                    continue
         # retry any failed model ids via pure translation in active view if rotation ~ 0
         if copy_failed_ids.Count > 0 and abs(angle) < 1e-6:
             try:
@@ -453,6 +499,91 @@ def main():
                 views_copied = len(list(v_new))
             except Exception:
                 views_failed = view_ids.Count
+        # recreate center lines that still failed by drawing model curves
+        if fail_by_cat.get("Center line") or fail_by_cat.get("Center Line"):
+            from Autodesk.Revit.DB import SketchPlane, Plane
+
+            for catlabel in ("Center line", "Center Line"):
+                ids_for_cat = fail_by_cat.get(catlabel, [])
+                for rid in ids_for_cat:
+                    try:
+                        e = doc.GetElement(rid)
+                        loc = getattr(e, "Location", None)
+                        if not loc or not hasattr(loc, "Curve"):
+                            continue
+                        curve = loc.Curve
+                        new_curve = curve.CreateTransformed(xf)
+                        # build a sketch plane that contains the curve
+                        try:
+                            dir = new_curve.ComputeDerivatives(0.5, True).BasisX
+                        except Exception:
+                            dir = None
+                        if dir is None:
+                            continue
+                        normal = dir.CrossProduct(XYZ.BasisZ)
+                        if normal.GetLength() < 1e-6:
+                            normal = dir.CrossProduct(XYZ.BasisX)
+                        if normal.GetLength() < 1e-6:
+                            normal = XYZ.BasisZ
+                        normal = normal.Normalize()
+                        plane = Plane.CreateByNormalAndOrigin(
+                            normal, new_curve.GetEndPoint(0)
+                        )
+                        sp = SketchPlane.Create(doc, plane)
+                        mc = doc.Create.NewModelCurve(new_curve, sp)
+                        copied += 1
+                        # add to mapping (best-effort)
+                        mapping_pairs.append((rid, mc.Id))
+                        # remove from skipped details
+                        skipped_details = [
+                            sd
+                            for sd in skipped_details
+                            if not (sd[1] == "copy fail" and sd[2] == catlabel)
+                        ]
+                    except Exception:
+                        continue
+        # recreate center lines that still failed by drawing model curves
+        if fail_by_cat.get("Center line") or fail_by_cat.get("Center Line"):
+            from Autodesk.Revit.DB import SketchPlane, Plane
+
+            for catlabel in ("Center line", "Center Line"):
+                ids_for_cat = fail_by_cat.get(catlabel, [])
+                for rid in ids_for_cat:
+                    try:
+                        e = doc.GetElement(rid)
+                        loc = getattr(e, "Location", None)
+                        if not loc or not hasattr(loc, "Curve"):
+                            continue
+                        curve = loc.Curve
+                        new_curve = curve.CreateTransformed(xf)
+                        # build a sketch plane that contains the curve
+                        try:
+                            dir = new_curve.ComputeDerivatives(0.5, True).BasisX
+                        except Exception:
+                            dir = None
+                        if dir is None:
+                            continue
+                        # choose a normal not parallel to dir
+                        normal = dir.CrossProduct(XYZ.BasisZ)
+                        if normal.GetLength() < 1e-6:
+                            normal = dir.CrossProduct(XYZ.BasisX)
+                        if normal.GetLength() < 1e-6:
+                            normal = XYZ.BasisZ
+                        normal = normal.Normalize()
+                        plane = Plane.CreateByNormalAndOrigin(
+                            normal, new_curve.GetEndPoint(0)
+                        )
+                        sp = SketchPlane.Create(doc, plane)
+                        doc.Create.NewModelCurve(new_curve, sp)
+                        copied += 1
+                        # remove from skipped details
+                        skipped_details = [
+                            sd
+                            for sd in skipped_details
+                            if not (sd[1] == "copy fail" and sd[2] == catlabel)
+                        ]
+                    except Exception:
+                        continue
         t.Commit()
     except Exception as ex:
         t.RollBack()
@@ -469,6 +600,35 @@ def main():
                 print(" - Id {} | {} | {}".format(sid, reason, cat))
         return
 
+    # assign systems to copied pipes/ducts based on source mapping
+    sys_set = 0
+    sys_fail = 0
+    if mapping_pairs:
+        for sid, nid in mapping_pairs:
+            try:
+                src = doc.GetElement(sid)
+                dst = doc.GetElement(nid)
+                if not src or not dst or not src.IsValidObject or not dst.IsValidObject:
+                    continue
+                catname = cat_name(src)
+                if catname.lower().startswith("pipe"):
+                    param = src.get_Parameter(BuiltInParameter.RBS_PIPING_SYSTEM_TYPE_PARAM)
+                    dstp = dst.get_Parameter(BuiltInParameter.RBS_PIPING_SYSTEM_TYPE_PARAM)
+                elif catname.lower().startswith("duct"):
+                    param = src.get_Parameter(BuiltInParameter.RBS_DUCT_SYSTEM_TYPE_PARAM)
+                    dstp = dst.get_Parameter(BuiltInParameter.RBS_DUCT_SYSTEM_TYPE_PARAM)
+                else:
+                    continue
+                if param and dstp and not dstp.IsReadOnly:
+                    stid = param.AsElementId()
+                    if stid and stid != ElementId.InvalidElementId:
+                        dstp.Set(stid)
+                        sys_set += 1
+                    else:
+                        sys_fail += 1
+            except Exception:
+                sys_fail += 1
+
     # print skipped summary
     if skipped_details:
         cat_counts = {}
@@ -482,13 +642,15 @@ def main():
 
     TaskDialog.Show(
         "transform_engine",
-        "Copied {} element(s).\nView-specific copied: {} | failed/skipped: {}\nViews copied: {} | failed/skipped: {}\nInvalid/unsupported skipped: {}".format(
+        "Copied {} element(s).\nView-specific copied: {} | failed/skipped: {}\nViews copied: {} | failed/skipped: {}\nInvalid/unsupported skipped: {}\nSystems set: {} | failed: {}".format(
             copied,
             vs_copied,
             vs_ids.Count - vs_copied + vs_failed,
             views_copied,
             views_failed,
             skipped_bad,
+            sys_set,
+            sys_fail,
         ),
     )
 
