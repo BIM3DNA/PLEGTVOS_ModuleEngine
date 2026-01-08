@@ -344,14 +344,22 @@ def main():
     view_ids = ClrList[ElementId]()
     assembly_ids = set()
     skipped_bad = 0
+    skipped_details = []  # list of (id, reason, category)
 
     def is_view_elem(e):
         return isinstance(e, View)
+
+    def cat_name(e):
+        try:
+            return e.Category.Name if e.Category else "<None>"
+        except Exception:
+            return "<Error>"
 
     for i in elem_ids:
         e = doc.GetElement(i)
         if not e or not e.IsValidObject:
             skipped_bad += 1
+            skipped_details.append((i.IntegerValue, "invalid", "<None>"))
             continue
         if is_view_elem(e):
             view_ids.Add(i)
@@ -372,6 +380,7 @@ def main():
             pass
         if e.Category is None:
             skipped_bad += 1
+            skipped_details.append((i.IntegerValue, "no category", "<None>"))
             continue
         idlist.Add(i)
 
@@ -384,6 +393,7 @@ def main():
     copied = 0
     views_copied = 0
     views_failed = 0
+    copy_failed_ids = ClrList[ElementId]()
 
     t = Transaction(doc, "Transform Engine Copy")
     try:
@@ -405,6 +415,14 @@ def main():
                         copied += len(list(res))
                     except Exception:
                         skipped_bad += 1
+                        copy_failed_ids.Add(eid)
+                        try:
+                            e = doc.GetElement(eid)
+                            skipped_details.append(
+                                (eid.IntegerValue, "copy fail", cat_name(e))
+                            )
+                        except Exception:
+                            pass
         # attempt view-specific move only if rotation is ~0 (translation only)
         angle = math.atan2(xf.BasisX.Y, xf.BasisX.X)
         if vs_ids.Count > 0 and abs(angle) < 1e-6:
@@ -418,6 +436,16 @@ def main():
                 vs_failed = vs_ids.Count
         elif vs_ids.Count > 0:
             vs_failed = vs_ids.Count
+        # retry any failed model ids via pure translation in active view if rotation ~ 0
+        if copy_failed_ids.Count > 0 and abs(angle) < 1e-6:
+            try:
+                retry = ElementTransformUtils.CopyElements(
+                    uidoc.ActiveView, copy_failed_ids, xf.Origin
+                )
+                copied += len(list(retry))
+                copy_failed_ids = ClrList[ElementId]()  # clear failures
+            except Exception:
+                pass
         # attempt views copy if any
         if view_ids.Count > 0:
             try:
@@ -434,7 +462,23 @@ def main():
                 ex, idlist.Count, vs_ids.Count, skipped_bad
             ),
         )
+        # log skipped details
+        if skipped_details:
+            print("Skipped (partial list):")
+            for sid, reason, cat in skipped_details[:50]:
+                print(" - Id {} | {} | {}".format(sid, reason, cat))
         return
+
+    # print skipped summary
+    if skipped_details:
+        cat_counts = {}
+        for _, reason, cat in skipped_details:
+            key = reason + " :: " + cat
+            cat_counts[key] = cat_counts.get(key, 0) + 1
+        print("Skipped breakdown (reason :: category):")
+        for k, v in sorted(cat_counts.items(), key=lambda x: -x[1])[:20]:
+            print(" - {} : {}".format(k, v))
+        print("Total skipped detailed: {}".format(len(skipped_details)))
 
     TaskDialog.Show(
         "transform_engine",
