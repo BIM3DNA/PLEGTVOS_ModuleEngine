@@ -32,6 +32,7 @@ from Autodesk.Revit.DB import (
     FilterStringEquals,
     XYZ,
     Transaction,
+    TransactionGroup,
     TextNote,
     TextNoteType,
     TextNoteOptions,
@@ -70,7 +71,11 @@ from Autodesk.Revit.Exceptions import *
 from Autodesk.Revit.Attributes import *
 from Autodesk.Revit.Exceptions import ArgumentException
 from System.Collections.Generic import List as ClrList
-from Autodesk.Revit.DB import IFailuresPreprocessor, FailureProcessingResult, FailureSeverity
+from Autodesk.Revit.DB import (
+    IFailuresPreprocessor,
+    FailureProcessingResult,
+    FailureSeverity,
+)
 
 import clr
 import System
@@ -185,10 +190,9 @@ def load_collected_ids():
             return []
         with open(collected_path, "r") as fp:
             data = json.load(fp)
-        ids = (
-            data.get("elements", {}).get("valid_ids", [])
-            or data.get("elements", {}).get("ids", [])
-        )
+        ids = data.get("elements", {}).get("valid_ids", []) or data.get(
+            "elements", {}
+        ).get("ids", [])
         if not ids:
             ids = (
                 data.get("source_state", {})
@@ -196,9 +200,7 @@ def load_collected_ids():
                 .get("elements", {})
                 .get("ids", [])
             )
-        elems = [
-            doc.GetElement(ElementId(int(i))) for i in ids if i is not None
-        ]
+        elems = [doc.GetElement(ElementId(int(i))) for i in ids if i is not None]
         return [e.Id for e in elems if e and e.IsValidObject]
     except Exception:
         return []
@@ -312,7 +314,33 @@ def filter_ids(ids):
     return ids_ok, skipped_group, expanded_assembly
 
 
+def _accum_bbox(created_bbox, bb):
+    if created_bbox is None:
+        created_bbox = BoundingBoxXYZ()
+        created_bbox.Min = XYZ(bb.Min.X, bb.Min.Y, bb.Min.Z)
+        created_bbox.Max = XYZ(bb.Max.X, bb.Max.Y, bb.Max.Z)
+        return created_bbox
+
+    created_bbox.Min = XYZ(
+        min(created_bbox.Min.X, bb.Min.X),
+        min(created_bbox.Min.Y, bb.Min.Y),
+        min(created_bbox.Min.Z, bb.Min.Z),
+    )
+    created_bbox.Max = XYZ(
+        max(created_bbox.Max.X, bb.Max.X),
+        max(created_bbox.Max.Y, bb.Max.Y),
+        max(created_bbox.Max.Z, bb.Max.Z),
+    )
+    return created_bbox
+
+
 def main():
+    preflight_errors = []
+    hard_skipped = []
+    created_bbox = None
+    allowed_ids = []
+    mirrored = 0
+
     mode = ask_mode()
     if mode == "none":
         TaskDialog.Show("mirror_handler", "Mirror cancelled (mode = None).")
@@ -335,7 +363,7 @@ def main():
     if not ids:
         TaskDialog.Show(
             "mirror_handler",
-            "No ids loaded from collected_latest.json. Run element_collector first.",
+            "No ids loaded. Run element_collector first.",
         )
         return
 
@@ -344,144 +372,140 @@ def main():
         TaskDialog.Show("mirror_handler", "All elements skipped (group/assembly).")
         return
 
-    mirrored = 0
-    failures = 0
-    pinned_reset = []
+    # --- Execution (single undo) ---
+    run_errors = []
+    preflight_errors = []
     hard_skipped = []
     created_ids = []
-    created_bbox = None
+    failures = 0
+    pinned_reset = []
+    created_bbox = None  # optional
 
-    class SwallowWarnings(IFailuresPreprocessor):
-        def __init__(self, err_list):
-            self.err_list = err_list
+    class RollbackOnError(IFailuresPreprocessor):
+        def __init__(self, err_log):
+            self.err_log = err_log
 
-        def PreprocessFailures(self, failuresAccessor):
+        def PreprocessFailures(self, fa):
             try:
-                for fmsg in failuresAccessor.GetFailureMessages():
-                    sev = fmsg.GetSeverity()
+                msgs = fa.GetFailureMessages()
+                for m in msgs:
+                    sev = m.GetSeverity()
                     if sev == FailureSeverity.Warning:
-                        failuresAccessor.DeleteWarning(fmsg)
+                        fa.DeleteWarning(m)
                     else:
-                        # capture description and force rollback
+                        # record something useful
                         try:
-                            self.err_list.append(fmsg.GetDescriptionText())
+                            self.err_log.append(m.GetDescriptionText())
                         except Exception:
-                            pass
+                            self.err_log.append("Non-warning failure (no description).")
                         return FailureProcessingResult.ProceedWithRollBack
                 return FailureProcessingResult.Continue
             except Exception:
-                return FailureProcessingResult.Continue
+                return FailureProcessingResult.ProceedWithRollBack
 
-    def make_opts(tx, err_list):
-        opts_local = tx.GetFailureHandlingOptions()
-        opts_local.SetFailuresPreprocessor(SwallowWarnings(err_list))
-        opts_local.SetClearAfterRollback(True)
-        return opts_local
+    # --- Failure handling helper (use everywhere) ---
+    def set_failure_opts(tx, err_log):
+        # Only Transaction support failure handling options; SubTransaction do not
+        opts = tx.GetFailureHandlingOptions()
+        opts.SetFailuresPreprocessor(RollbackOnError(err_log))
+        opts.SetClearAfterRollback(True)
+        tx.SetFailureHandlingOptions(opts)
 
-    # Preflight each element in a rollback transaction to avoid hard errors
+    # --- Preflight (optional but ok) ---
+    # - checks if mirror will trigger non-ignorable failures
     allowed_ids = []
     preflight_errors = []
+    hard_skipped = []
+
     for eid in ids_clr:
-        el = doc.GetElement(eid)
-        if not el or not el.IsValidObject:
-            continue
-        pre = Transaction(doc, "mirror_preflight")
+        tx = Transaction(doc, "mirror_handler: Preflight One")
         try:
-            pre.SetFailureHandlingOptions(make_opts(pre, preflight_errors))
-            pre.Start()
+            tx.Start()
+            set_failure_opts(tx, preflight_errors)
+
+            ElementTransformUtils.MirrorElements(
+                doc, ClrList[ElementId]([eid]), plane, do_copy
+            )
+            # If we reached here, no non-warning failure forced rollback yet.
+            # We still rollback becasue preflight must not persist
+            allowed_ids.append(eid)
+            tx.RollBack()
+
+        except Exception as ex:
             try:
-                ElementTransformUtils.MirrorElements(
-                    doc, ClrList[ElementId]([eid]), plane, do_copy
-                )
-                allowed_ids.append(eid)
-            except Exception:
-                hard_skipped.append(eid)
-            pre.RollBack()
-        except Exception:
-            try:
-                pre.RollBack()
+                tx.RollBack()
             except Exception:
                 pass
             hard_skipped.append(eid)
+            preflight_errors.append(str(ex))
 
+    # Roll back the entire preflight transaction so NOTHING is left behind
     if not allowed_ids:
         TaskDialog.Show(
-            "mirror_handler",
-            "All elements failed mirror preflight; nothing mirrored.",
+            "mirror_handler", "All elements failed preflight; nothing to mirror."
         )
         return
 
-    run_errors = []
+    # ---------------------------------
+    # Execution (single undo)
+    # - TransactionGroup => ONE undo step
+    # - per-element Transaction => failures rollback locally
+    # ---------------------------------
+    tg = TransactionGroup(doc, "mirror_handler: Mirror Copy")
+    tg.Start()
+
     created_ids = []
-    created_bbox = None
-    t = Transaction(doc, "Mirror Handler")
-    try:
-        t.SetFailureHandlingOptions(make_opts(t, run_errors))
-        t.Start()
-        # handle each id individually so one bad category does not cancel all
-        for eid in allowed_ids:
+    run_errors = []
+    failures = 0
+
+    # Set this on each inner transaction (not on a single outer transaction)
+    for eid in allowed_ids:
+        tx = Transaction(doc, "mirror_handler: Mirror One")
+        try:
+            tx.Start()
+            set_failure_opts(tx, run_errors)  # safe: transaction supports it
+
+            el = doc.GetElement(eid)
+            was_pinned = False
+            if el and hasattr(el, "Pinned") and el.Pinned:
+                was_pinned = True
+                el.Pinned = False
+
+            res_ids = ElementTransformUtils.MirrorElements(
+                doc, ClrList[ElementId]([eid]), plane, do_copy
+            )
+
+            status = tx.Commit()
+            # preprocessor may force rollback
+
+            if status == TransactionStatus.Committed:
+                for rid in list(res_ids):
+                    re = doc.GetElement(rid)
+                    if re and re.IsValidObject:
+                        created_ids.append(rid)
+            else:
+                failures += 1
+
+            # re-prin only if commit succeeded
+            if was_pinned and status == TransactionStatus.Committed:
+                el2 = doc.GetElement(eid)
+                if el2 and el2.IsValidObject:
+                    el2.Pinned = True
+
+        except Exception as ex:
+            failures += 1
+            run_errors.append(str(ex))
             try:
-                el = doc.GetElement(eid)
-                if not el or not el.IsValidObject:
-                    failures += 1
-                    continue
-                # unpin temporarily if needed
-                try:
-                    if hasattr(el, "Pinned") and el.Pinned:
-                        el.Pinned = False
-                        pinned_reset.append(eid)
-                except Exception:
-                    pass
-                res_ids = ElementTransformUtils.MirrorElements(
-                    doc, ClrList[ElementId]([eid]), plane, do_copy
-                )
-                res_list = list(res_ids)
-                mirrored += len(res_list)
-                created_ids.extend(res_list)
-                # accumulate bbox for visibility hint
-                try:
-                    for rid in res_list:
-                        relem = doc.GetElement(rid)
-                        if not relem:
-                            continue
-                        bb = relem.get_BoundingBox(None)
-                        if not bb:
-                            continue
-                        if created_bbox is None:
-                            created_bbox = BoundingBoxXYZ()
-                            created_bbox.Min = XYZ(bb.Min.X, bb.Min.Y, bb.Min.Z)
-                            created_bbox.Max = XYZ(bb.Max.X, bb.Max.Y, bb.Max.Z)
-                        else:
-                            created_bbox.Min = XYZ(
-                                min(created_bbox.Min.X, bb.Min.X),
-                                min(created_bbox.Min.Y, bb.Min.Y),
-                                min(created_bbox.Min.Z, bb.Min.Z),
-                            )
-                            created_bbox.Max = XYZ(
-                                max(created_bbox.Max.X, bb.Max.X),
-                                max(created_bbox.Max.Y, bb.Max.Y),
-                                max(created_bbox.Max.Z, bb.Max.Z),
-                            )
-                except Exception:
-                    failures += 1
-        # re-pin anything we unpinned
-        for pid in pinned_reset:
-            try:
-                pel = doc.GetElement(pid)
-                if pel and pel.IsValidObject:
-                    pel.Pinned = True
+                tx.RollBack()
             except Exception:
                 pass
-        t.Commit()
-    except Exception:
-        try:
-            t.RollBack()
-        except Exception:
-            pass
-        TaskDialog.Show("mirror_handler", "Mirror failed; transaction rolled back.")
-        return
 
-    # highlight new elements if any
+    tg.Assimilate()  # ONE undo step
+
+    mirrored = len(created_ids)
+
+    # Select created ids (helps visual verification)
+
     try:
         if created_ids:
             uidoc.Selection.SetElementIds(ClrList[ElementId](created_ids))
@@ -489,25 +513,21 @@ def main():
         pass
 
     bbox_note = ""
-    try:
-        if created_bbox:
-            cx = (created_bbox.Min.X + created_bbox.Max.X) * 0.5
-            cy = (created_bbox.Min.Y + created_bbox.Max.Y) * 0.5
-            cz = (created_bbox.Min.Z + created_bbox.Max.Z) * 0.5
-            bbox_note = "\nNew bbox center: ({:.3f}, {:.3f}, {:.3f})".format(
-                cx, cy, cz
-            )
-    except Exception:
-        bbox_note = ""
+    if created_bbox:
+        cx = (created_bbox.Min.X + created_bbox.Max.X) * 0.5
+        cy = (created_bbox.Min.Y + created_bbox.Max.Y) * 0.5
+        cz = (created_bbox.Min.Z + created_bbox.Max.Z) * 0.5
+        bbox_note = "\nNew bbox center: ({:.3f}, {:.3f}, {:.3f})".format(cx, cy, cz)
 
     msg = (
         "Mode: {0}\nCopy mode: {1}\n"
-        "Mirrored: {2}\n"
-        "Failures: {3}\n"
+        "Created: {2}\n"
+        "Failures (rolled back / exceptions): {3}\n"
         "Skipped groups: {4}\n"
         "Assemblies expanded: {5}\n"
         "Hard skipped (preflight): {6}\n"
-        "Plane normal: ({7:.3f},{8:.3f},{9:.3f}){10}".format(
+        "Plane normal: ({7:.3f},{8:.3f},{9:.3f}){10}\n"
+        "Run error samples: {11}".format(
             mode,
             "Create copy" if do_copy else "In-place",
             mirrored,
@@ -519,6 +539,7 @@ def main():
             plane.Normal.Y,
             plane.Normal.Z,
             bbox_note,
+            "\n- " + "\n- ".join(run_errors[:10]) if run_errors else "None",
         )
     )
     TaskDialog.Show("mirror_handler", msg)
