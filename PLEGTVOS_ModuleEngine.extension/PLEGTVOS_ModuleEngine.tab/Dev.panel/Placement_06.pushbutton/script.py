@@ -213,6 +213,343 @@ def pick_scopebox(prompt):
     return doc.GetElement(ref.ElementId)
 
 
+def _to_local_xyz(Tiny, p):
+    return Tiny.OfPoint(p)
+
+
+def _bbox_intersects_scopebox(elem, sb):
+    """Fast AABB overlap test in scope box local space coordinates."""
+    try:
+        ebb = elem.get_BoundingBox(None)
+        sbb = sb.get_BoundingBox(None)
+        if not ebb or not sbb or not sbb.Transform:
+            return False
+
+        Tiny = sbb.Transform.Inverse
+
+        # element bb corners > scope box local
+        pts = [
+            _to_local_xyz(Tiny, XYZ(ebb.Min.X, ebb.Min.Y, ebb.Min.Z)),
+            _to_local_xyz(Tiny, XYZ(ebb.Min.X, ebb.Min.Y, ebb.Max.Z)),
+            _to_local_xyz(Tiny, XYZ(ebb.Min.X, ebb.Max.Y, ebb.Min.Z)),
+            _to_local_xyz(Tiny, XYZ(ebb.Min.X, ebb.Max.Y, ebb.Max.Z)),
+            _to_local_xyz(Tiny, XYZ(ebb.Max.X, ebb.Min.Y, ebb.Min.Z)),
+            _to_local_xyz(Tiny, XYZ(ebb.Max.X, ebb.Min.Y, ebb.Max.Z)),
+            _to_local_xyz(Tiny, XYZ(ebb.Max.X, ebb.Max.Y, ebb.Min.Z)),
+            _to_local_xyz(Tiny, XYZ(ebb.Max.X, ebb.Max.Y, ebb.Max.Z)),
+        ]
+
+        mn = XYZ(min(p.X for p in pts), min(p.Y for p in pts), min(p.Z for p in pts))
+        mx = XYZ(max(p.X for p in pts), max(p.Y for p in pts), max(p.Z for p in pts))
+
+        # scope local extents
+        sb_mn = sbb.Min
+        sb_mx = sbb.Max
+
+        # AABB overlap
+        if mx.X < sb_mn.X or mn.X > sb_mx.X:
+            return False
+        if mx.Y < sb_mn.Y or mn.Y > sb_mx.Y:
+            return False
+        if mx.Z < sb_mn.Z or mn.Z > sb_mx.Z:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def filter_ids_by_scopebox(ids_clr, src_sb):
+    ids_out = []
+    for eid in ids_clr:
+        e = doc.GetElement(eid)
+        if not e or not e.IsValidObject:
+            continue
+        if _bbox_intersects_scopebox(e, src_sb):
+            ids_out.append(eid)
+    return ids_out
+
+
+def scopebox_center_world(sb):
+    bb = sb.get_BoundingBox(None)
+    if not bb or not bb.Transform:
+        raise Exception("Scope box has no bounding box/transform.")
+    T = bb.Transform
+    mn = bb.Min
+    mx = bb.Max
+    c_local = XYZ((mn.X + mx.X) * 0.5, (mn.Y + mx.Y) * 0.5, (mn.Z + mx.Z) * 0.5)
+    return T.OfPoint(c_local)
+
+
+def scopebox_axis_world(sb, axis="X", flatten_z=True):
+    bb = sb.get_BoundingBox(None)
+    if not bb or not bb.Transform:
+        raise Exception("Scope box has no bounding box/transform.")
+
+    T = bb.Transform
+    a = (axis or "X").upper()
+
+    if a == "X":
+        v = T.BasisX
+    elif a == "Y":
+        v = T.BasisY
+    elif a == "Z":
+        v = T.BasisZ
+    else:
+        # defensive fallback
+        v = T.BasisX
+
+    if flatten_z:
+        v = XYZ(v.X, v.Y, 0.0)
+
+    if v.GetLength() < 1e-9:
+        v = XYZ(1, 0, 0)
+
+    return v.Normalize()
+
+
+def build_mapping_mirror_plane(src_sb, tgt_sb, mode="center"):
+    """
+    Builds mirror plane with normal aligned to TARGET scopebox X axis (world),
+    and origin chosen so that reflecting SOURCE center -> TARGET center."""
+    n = scopebox_axis_world(tgt_sb, axis="X", flatten_z=True)
+
+    cS = scopebox_center_world(src_sb)
+    cT = scopebox_center_world(tgt_sb)
+
+    # Choose origin so reflection maps cS -> cT:
+    # cT = cS - 2*n*(n.(cS - 0)) => n.(cS - 0) = 0.5 * n.(cS - cT)
+    d = cS - cT
+    a = 0.5 * (n.DotProduct(d))
+    o = cS - (a * n)
+
+    # Optional: support left/right faces by shifting plane along n
+    # (using TARGET local extents projected to world)
+    if mode in ("left_face", "right_face"):
+        bb = tgt_sb.get_BoundingBox(None)
+        T = bb.Transform
+        # local X extents
+        x_face = bb.Min.X if mode == "left_face" else bb.Max.X
+        # plane point at that local x, at local center y,z
+        ymid = (bb.Min.Y + bb.Max.Y) * 0.5
+        zmid = (bb.Min.Z + bb.Max.Z) * 0.5
+        p_face_world = T.OfPoint(XYZ(x_face, ymid, zmid))
+
+        # We want the place to go through that face location, but still map cS -> cT
+        # If you truly want "face-based mapping", you need a consistent convention.
+        # Practical approach: replace o's projection along n to match the face:
+        # enforce n.o = n.p_face_world
+        o = o + ((n.DotProduct(p_face_world - o)) * n)
+
+    return Plane.CreateByNormalAndOrigin(n, o)
+
+
+def reflect_point_about_plane(p, plane):
+    # p' = p - 2*(n.(p - o)) * n
+    o = plane.Origin
+    n = plane.Normal.Normalize()
+    v = p - o
+    d = v.DotProduct(n)
+    return p - (2.0 * d) * n
+
+
+def reflect_vector_about_plane(v, plane):
+    n = plane.Normal.Normalize()
+    d = v.DotProduct(n)
+    return v - (2.0 * d) * n
+
+
+def scopebox_center_world(sb):
+    bb = sb.get_BoundingBox(None)
+    if not bb:
+        raise Exception("Scope box has no bounding box.")
+    T = bb.Transform
+    mn, mx = bb.Min, bb.Max
+    c_local = XYZ((mn.X + mx.X) * 0.5, (mn.Y + mx.Y) * 0.5, (mn.Z + mx.Z) * 0.5)
+    return T.OfPoint(c_local)
+
+
+def collect_groups_in_scopebox(src_sb):
+    out = []
+    try:
+        grps = FilteredElementCollector(doc).OfClass(Group).ToElements()
+        for g in grps:
+            try:
+                if _bbox_intersects_scopebox(g, src_sb):
+                    out.append(g.Id)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return out
+
+
+def collect_groups_by_member_intersection(ids_in_src):
+    """Return unique group instance ElementIds for any element in ids_in_src that is a group member."""
+    gids = []
+    seen = set()
+    for eid in ids_in_src:
+        e = doc.GetElement(eid)
+        if not e or not e.IsValidObject:
+            continue
+        try:
+            gid = getattr(e, "GroupId", ElementId.InvalidElementId)
+            if gid and gid != ElementId.InvalidElementId:
+                if gid.IntegerValue not in seen:
+                    gids.append(gid)
+                    seen.add(gid.IntegerValue)
+        except Exception:
+            pass
+    return gids
+
+
+def _bboxxyz_world_aabb(bbxyz):
+    """Return world-space (min, max) XYZ for a BoundingBoxXYZ."""
+    T = bbxyz.Transform
+    mn = bbxyz.Min
+    mx = bbxyz.Max
+    pts = [
+        T.OfPoint(XYZ(mn.X, mn.Y, mn.Z)),
+        T.OfPoint(XYZ(mn.X, mn.Y, mx.Z)),
+        T.OfPoint(XYZ(mn.X, mx.Y, mn.Z)),
+        T.OfPoint(XYZ(mn.X, mx.Y, mx.Z)),
+        T.OfPoint(XYZ(mx.X, mn.Y, mn.Z)),
+        T.OfPoint(XYZ(mx.X, mn.Y, mx.Z)),
+        T.OfPoint(XYZ(mx.X, mx.Y, mn.Z)),
+        T.OfPoint(XYZ(mx.X, mx.Y, mx.Z)),
+    ]
+    wmn = XYZ(min(p.X for p in pts), min(p.Y for p in pts), min(p.Z for p in pts))
+    wmx = XYZ(max(p.X for p in pts), max(p.Y for p in pts), max(p.Z for p in pts))
+    return wmn, wmx
+
+
+def section_intersects_scopebox(vs, sb):
+    """Test ovelap of ViewSection section box vs scope box in scope-box loxal space."""
+    try:
+        sbb = sb.get_BoundingBox(None)
+        if not sbb or not sbb.Transform:
+            return False
+        Tiny = sbb.Transform.Inverse
+
+        sec_bb = vs.GetSectionBox()
+        if not sec_bb:
+            return False
+
+        wmn, wmx = _bboxxyz_world_aabb(sec_bb)
+
+        # convert AABB corners to scopebox local for overlap test
+        pts = [
+            Tiny.OfPoint(XYZ(wmn.X, wmn.Y, wmn.Z)),
+            Tiny.OfPoint(XYZ(wmn.X, wmn.Y, wmx.Z)),
+            Tiny.OfPoint(XYZ(wmn.X, wmx.Y, wmn.Z)),
+            Tiny.OfPoint(XYZ(wmn.X, wmx.Y, wmx.Z)),
+            Tiny.OfPoint(XYZ(wmx.X, wmn.Y, wmn.Z)),
+            Tiny.OfPoint(XYZ(wmx.X, wmn.Y, wmx.Z)),
+            Tiny.OfPoint(XYZ(wmx.X, wmx.Y, wmn.Z)),
+            Tiny.OfPoint(XYZ(wmx.X, wmx.Y, wmx.Z)),
+        ]
+
+        mn = XYZ(min(p.X for p in pts), min(p.Y for p in pts), min(p.Z for p in pts))
+        mx = XYZ(max(p.X for p in pts), max(p.Y for p in pts), max(p.Z for p in pts))
+
+        sb_mn = sbb.Min
+        sb_mx = sbb.Max
+
+        if mx.X < sb_mn.X or mn.X > sb_mx.X:
+            return False
+        if mx.Y < sb_mn.Y or mn.Y > sb_mx.Y:
+            return False
+        if mx.Z < sb_mn.Z or mn.Z > sb_mx.Z:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def map_section_box(sec_bb, plane, move_vec):
+    """
+    Reflect section BoundingBoxXYZ about plane, then translate by move_vec.
+    Ensures returned Transform is right-handed.
+    """
+    T0 = sec_bb.Transform
+
+    # Map origin
+    o0 = T0.Origin
+    o1 = reflect_point_about_plane(o0, plane) + move_vec
+
+    # Reflect basis vectors
+    bx = reflect_vector_about_plane(T0.BasisX, plane)
+    by = reflect_vector_about_plane(T0.BasisY, plane)
+
+    # Ensure non-degenerate
+    if bx.GetLength() < 1e-9:
+        bx = XYZ(1, 0, 0)
+    if by.GetLength() < 1e-9:
+        by = XYZ(0, 1, 0)
+
+    bx = bx.Normalize()
+    by = by.Normalize()
+
+    # Enforce right-handed coordinate system
+    bz = bx.CrossProduct(by)
+    if bz.GetLength() < 1e-9:
+        # fallback: build an othogonal by from bx and global Z
+        tmp = XYZ(0, 0, 1).CrossProduct(bx)
+        if tmp.GetLength() < 1e-9:
+            tmp = XYZ(0, 1, 0)
+        by = tmp.Normalize()
+        bz = bx.CrossProduct(by)
+
+    bz = bz.Normalize()
+    # Re-orthogonalize by
+    by = bz.CrossProduct(bx).Normalize()
+
+    T1 = Transform.Identity
+    T1.Origin = o1
+    T1.BasisX = bx
+    T1.BasisY = by
+    T1.BasisZ = bz
+
+    out = BoundingBoxXYZ()
+    out.Transform = T1
+    out.Min = sec_bb.Min
+    out.Max = sec_bb.Max
+    return out
+
+
+def copy_section_view_settings(src_vs, new_vs):
+    """Best-effort copy of ocmmon view properties. Keep minimal to avoid read-only failures."""
+    try:
+        new_vs.Scale = src_vs.Scale
+    except Exception:
+        pass
+    try:
+        new_vs.DetailLevel = src_vs.DetailLevel
+    except Exception:
+        pass
+    try:
+        new_vs.DisplayStyle = src_vs.DisplayStyle
+    except Exception:
+        pass
+    try:
+        if (
+            src_vs.ViewTemplateId
+            and src_vs.ViewTemplateId != ElementId.InvalidElementId
+        ):
+            new_vs.ViewTemplateId = src_vs.ViewTemplateId
+    except Exception:
+        pass
+
+    # Crop settings
+    try:
+        new_vs.CropBoxActive = src_vs.CropBoxActive
+    except Exception:
+        pass
+    try:
+        new_vs.CropBoxVisible = src_vs.CropBoxVisible
+    except Exception:
+        pass
+
+
 def mirror_plane_from_scopebox(sb, mode="center", offset_ft=0.0):
     bb = sb.get_BoundingBox(None)
     if not bb or not bb.Transform:
@@ -220,6 +557,7 @@ def mirror_plane_from_scopebox(sb, mode="center", offset_ft=0.0):
     T = bb.Transform
     mn = bb.Min
     mx = bb.Max
+
     xmid = (mn.X + mx.X) * 0.5
     ymid = (mn.Y + mx.Y) * 0.5
     zmid = (mn.Z + mx.Z) * 0.5
@@ -233,15 +571,18 @@ def mirror_plane_from_scopebox(sb, mode="center", offset_ft=0.0):
     else:
         xplane = xmid
 
-    plocal = XYZ(xplane, ymid, zmid)
-    pworld = T.OfPoint(plocal)
-    nworld = T.BasisX
-    nworld = XYZ(nworld.X, nworld.Y, 0.0)
-    if nworld.GetLength() < 1e-6:
-        nworld = XYZ(1, 0, 0)
-    nworld = nworld.Normalize()
-    plane = Plane.CreateByNormalAndOrigin(nworld, pworld)
-    return plane
+    # plane origin point in local SB coords -> world
+    p_local = XYZ(xplane, ymid, zmid)
+    p_world = T.OfPoint(p_local)
+
+    # plane normal is SB local X axis in world (flatten Z optional)
+    n_world = T.BasisX
+    n_world = XYZ(n_world.X, n_world.Y, 0.0)
+    if n_world.GetLength() < 1e-9:
+        n_world = XYZ(1, 0, 0)
+    n_world = n_world.Normalize()
+
+    return Plane.CreateByNormalAndOrigin(n_world, p_world)
 
 
 def ask_mode():
@@ -280,28 +621,29 @@ def ask_copy():
 
 def filter_ids(ids):
     ids_ok = ClrList[ElementId]()
-    skipped_group = 0
+    skipped_group_members = 0
     expanded_assembly = 0
     seen = set()
+
     for eid in ids:
         e = doc.GetElement(eid)
         if not e or not e.IsValidObject:
             continue
         try:
-            if getattr(e, "GroupId", ElementId.InvalidElementId) not in (
-                None,
-                ElementId.InvalidElementId,
-            ):
-                skipped_group += 1
+            gid = getattr(e, "GroupId", ElementId.InvalidElementId)
+            if gid and gid != ElementId.InvalidElementId:
+                # element is a group member > mirror the group instance instead
+                if gid.IntegerValue not in seen:
+                    ids_ok.Add(gid)
+                    seen.add(gid.IntegerValue)
+                skipped_group_members += 1
                 continue
             # if this is an assembly instance, expand to members
             if isinstance(e, AssemblyInstance):
-                mem_ids = e.GetMemberIds()
-                for mid in mem_ids:
-                    if mid.IntegerValue in seen:
-                        continue
-                    ids_ok.Add(mid)
-                    seen.add(mid.IntegerValue)
+                for mid in e.GetMemberIds():
+                    if mid.IntegerValue not in seen:
+                        ids_ok.Add(mid)
+                        seen.add(mid.IntegerValue)
                 expanded_assembly += 1
                 continue
             # if element belongs to an assembly, still include it
@@ -311,7 +653,8 @@ def filter_ids(ids):
             continue
         ids_ok.Add(eid)
         seen.add(eid.IntegerValue)
-    return ids_ok, skipped_group, expanded_assembly
+
+    return ids_ok, skipped_group_members, expanded_assembly
 
 
 def _accum_bbox(created_bbox, bb):
@@ -347,17 +690,21 @@ def main():
         return
     do_copy = ask_copy()
 
+    # --- Scope boxes: SOURCE (what to mirror) + TARGET (where to mirror) ---
     try:
-        sb = pick_scopebox("Pick TARGET scope box for mirror plane")
+        src_sb = pick_scopebox("Pick SOURCE scope box (elements to mirror)")
+        tgt_sb = pick_scopebox("Pick TARGET scope box (where to mirror)")
     except Exception:
         TaskDialog.Show("mirror_handler", "Scope box selection cancelled.")
         return
 
     try:
-        plane = mirror_plane_from_scopebox(sb, mode=mode)
+        plane = build_mapping_mirror_plane(src_sb, tgt_sb, mode=mode)
     except Exception as ex:
         TaskDialog.Show("mirror_handler", "Failed to build mirror plane: {}".format(ex))
         return
+
+    move_vec = XYZ(0, 0, 0)  # mapping plane already handles alignment
 
     ids = load_collected_ids()
     if not ids:
@@ -367,9 +714,22 @@ def main():
         )
         return
 
-    ids_clr, skipped_group, expanded_assembly = filter_ids(ids)
-    if ids_clr.Count == 0:
-        TaskDialog.Show("mirror_handler", "All elements skipped (group/assembly).")
+    ids_clr, skipped_group_members, expanded_assembly = filter_ids(ids)
+    ids_in_src = list(filter_ids_by_scopebox(ids_clr, src_sb))
+
+    # Explicitly include Group instances intersecting source scope box
+    grp_ids = collect_groups_by_member_intersection(ids_in_src)
+
+    if grp_ids:
+        # Merge unique
+        seen = set([x.IntegerValue for x in ids_in_src])
+        for gid in grp_ids:
+            if gid.IntegerValue not in seen:
+                ids_in_src.append(gid)
+                seen.add(gid.IntegerValue)
+
+    if not ids_in_src:
+        TaskDialog.Show("mirror_handler", "No elements found inside SOURCE scope box.")
         return
 
     # --- Execution (single undo) ---
@@ -417,10 +777,12 @@ def main():
     preflight_errors = []
     hard_skipped = []
 
-    for eid in ids_clr:
+    for eid in ids_in_src:
         tx = Transaction(doc, "mirror_handler: Preflight One")
+        started = False
         try:
             tx.Start()
+            started = True
             set_failure_opts(tx, preflight_errors)
 
             ElementTransformUtils.MirrorElements(
@@ -429,15 +791,16 @@ def main():
             # If we reached here, no non-warning failure forced rollback yet.
             # We still rollback becasue preflight must not persist
             allowed_ids.append(eid)
-            tx.RollBack()
 
         except Exception as ex:
-            try:
-                tx.RollBack()
-            except Exception:
-                pass
             hard_skipped.append(eid)
             preflight_errors.append(str(ex))
+        finally:
+            if started:
+                try:
+                    tx.RollBack()
+                except Exception:
+                    pass
 
     # Roll back the entire preflight transaction so NOTHING is left behind
     if not allowed_ids:
@@ -458,59 +821,165 @@ def main():
     run_errors = []
     failures = 0
 
-    # Set this on each inner transaction (not on a single outer transaction)
-    for eid in allowed_ids:
-        tx = Transaction(doc, "mirror_handler: Mirror One")
-        try:
-            tx.Start()
-            set_failure_opts(tx, run_errors)  # safe: transaction supports it
+    try:
+        batch_ok = False
+        batch_created = []
+        created_sections = []
 
-            el = doc.GetElement(eid)
-            was_pinned = False
-            if el and hasattr(el, "Pinned") and el.Pinned:
-                was_pinned = True
-                el.Pinned = False
+        # -----------------------------------------
+        # Batch mirror (preferred)
+        # -----------------------------------------
+        txb = Transaction(doc, "mirror_handler: Mirror Batch")
+        try:
+            txb.Start()
+            set_failure_opts(txb, run_errors)
 
             res_ids = ElementTransformUtils.MirrorElements(
-                doc, ClrList[ElementId]([eid]), plane, do_copy
+                doc, ClrList[ElementId](allowed_ids), plane, do_copy
             )
 
-            status = tx.Commit()
-            # preprocessor may force rollback
+            st = txb.Commit()
+            batch_ok = st == TransactionStatus.Committed
 
-            if status == TransactionStatus.Committed:
-                for rid in list(res_ids):
-                    re = doc.GetElement(rid)
-                    if re and re.IsValidObject:
-                        created_ids.append(rid)
-            else:
-                failures += 1
-
-            # re-prin only if commit succeeded
-            if was_pinned and status == TransactionStatus.Committed:
-                el2 = doc.GetElement(eid)
-                if el2 and el2.IsValidObject:
-                    el2.Pinned = True
+            if batch_ok and do_copy:
+                batch_created = list(res_ids)
 
         except Exception as ex:
-            failures += 1
-            run_errors.append(str(ex))
+            run_errors.append("Batch exception: {}".format(ex))
             try:
-                tx.RollBack()
+                txb.RollBack()
             except Exception:
                 pass
+            batch_ok = False
 
-    tg.Assimilate()  # ONE undo step
+        # -----------------------------------------
+        # Fallback per-element if batch fails
+        # -----------------------------------------
+        if not batch_ok:
+            for eid in allowed_ids:
+                tx = Transaction(doc, "mirror_handler: Mirror One")
+                started = False
+                try:
+                    tx.Start()
+                    started = True
+                    set_failure_opts(tx, run_errors)
+
+                    el = doc.GetElement(eid)
+                    was_pinned = False
+                    try:
+                        if el and hasattr(el, "Pinned") and el.Pinned:
+                            was_pinned = True
+                            el.Pinned = False
+                    except Exception:
+                        pass
+
+                    res_ids = ElementTransformUtils.MirrorElements(
+                        doc, ClrList[ElementId]([eid]), plane, do_copy
+                    )
+
+                    st = tx.Commit()
+                    if st == TransactionStatus.Committed:
+                        if do_copy:
+                            for rid in list(res_ids):
+                                re = doc.GetElement(rid)
+                                if re and re.IsValidObject:
+                                    created_ids.append(rid)
+
+                        if was_pinned:
+                            try:
+                                el2 = doc.GetElement(eid)
+                                if el2 and el2.IsValidObject:
+                                    el2.Pinned = True
+                            except Exception:
+                                pass
+                    else:
+                        failures += 1
+
+                except Exception as ex:
+                    failures += 1
+                    run_errors.append(
+                        "Per-element ({}): {}".format(eid.IntegerValue, ex)
+                    )
+                    try:
+                        if started:
+                            tx.RollBack()
+                    except Exception:
+                        pass
+
+        else:
+            # batch succeeded
+            created_ids.extend(batch_created)
+
+        # -----------------------------------------
+        # Explicit Section Recreation (always run)
+        # -----------------------------------------
+        try:
+            all_secs = FilteredElementCollector(doc).OfClass(ViewSection).ToElements()
+            sec_candidates = []
+            for vs in all_secs:
+                try:
+                    if vs.IsTemplate:
+                        continue
+                    if vs.ViewType != ViewType.Section:
+                        continue
+                    if section_intersects_scopebox(vs, src_sb):
+                        sec_candidates.append(vs)
+                except Exception:
+                    pass
+
+            if sec_candidates:
+                txs = Transaction(doc, "mirror_handler: Recreate Sections")
+                txs.Start()
+                set_failure_opts(txs, run_errors)
+
+                for src_vs in sec_candidates:
+                    try:
+                        sec_bb = src_vs.GetSectionBox()
+                        if not sec_bb:
+                            continue
+
+                        new_bb = map_section_box(sec_bb, plane, move_vec)
+
+                        vft = doc.GetElement(src_vs.GetTypeId())
+                        if not vft:
+                            continue
+
+                        new_vs = ViewSection.CreateSection(doc, vft.Id, new_bb)
+                        if not new_vs:
+                            continue
+
+                        copy_section_view_settings(src_vs, new_vs)
+
+                        try:
+                            new_vs.Name = "{}_MIR".format(src_vs.Name)
+                        except Exception:
+                            pass
+
+                        created_sections.append(new_vs.Id)
+
+                    except Exception as ex:
+                        run_errors.append(
+                            "Section recreate ({}): {}".format(
+                                src_vs.Id.IntegerValue, ex
+                            )
+                        )
+
+                txs.Commit()
+
+        except Exception as ex:
+            run_errors.append("Section pass failed: {}".format(ex))
+
+        tg.Assimilate()
+
+    except Exception:
+        # hard failure: close the transaction group
+        try:
+            tg.RollBack()
+        except Exception:
+            pass
+        raise
 
     mirrored = len(created_ids)
-
-    # Select created ids (helps visual verification)
-
-    try:
-        if created_ids:
-            uidoc.Selection.SetElementIds(ClrList[ElementId](created_ids))
-    except Exception:
-        pass
 
     bbox_note = ""
     if created_bbox:
@@ -532,7 +1001,7 @@ def main():
             "Create copy" if do_copy else "In-place",
             mirrored,
             failures,
-            skipped_group,
+            skipped_group_members,
             expanded_assembly,
             len(hard_skipped),
             plane.Normal.X,
