@@ -465,6 +465,40 @@ def section_intersects_scopebox(vs, sb):
         return False
 
 
+def point_in_scopebox(p_world, sb):
+    """Return True if world point lies inside scope box extents (in scope local coords)."""
+    bb = sb.get_BoundingBox(None)
+    if not bb or not bb.Transform:
+        return False
+    Tiny = bb.Transform.Inverse
+    pl = Tiny.OfPoint(p_world)
+    mn, mx = bb.Min, bb.Max
+    return (mn.X <= pl.X <= mx.X) and (mn.Y <= pl.Y <= mx.Y) and (mn.Z <= pl.Z <= mx.Z)
+
+
+def collect_group_instances_in_scopebox(src_sb):
+    """Collect both Model Groups and Detail Groups whose insertion point lies in SOURCE scope box"""
+    out = []
+    seen = set()
+    for g in FilteredElementCollector(doc).OfClass(Group).ToElements():
+        try:
+            loc = g.Location
+            p = None
+            if isinstance(loc, LocationPoint):
+                p = loc.Point
+            elif isinstance(loc, LocationCurve):
+                crv = loc.Curve
+                p = crv.Evaluate(0.5, True)  # mid-point
+
+            if p and point_in_scopebox(p, src_sb):
+                if g.Id.IntegerValue not in seen:
+                    out.append(g.Id)
+                    seen.add(g.Id.IntegerValue)
+        except Exception:
+            pass
+    return out
+
+
 def map_section_box(sec_bb, plane, move_vec):
     """
     Reflect section BoundingBoxXYZ about plane, then translate by move_vec.
@@ -717,16 +751,32 @@ def main():
     ids_clr, skipped_group_members, expanded_assembly = filter_ids(ids)
     ids_in_src = list(filter_ids_by_scopebox(ids_clr, src_sb))
 
-    # Explicitly include Group instances intersecting source scope box
-    grp_ids = collect_groups_by_member_intersection(ids_in_src)
+    # --- Groups: union of (by location) + (member)
+    grp_ids_loc = collect_group_instances_in_scopebox(src_sb)  # robust
+    grp_ids_mem = collect_groups_by_member_intersection(ids_in_src)  # opportunistc
 
-    if grp_ids:
-        # Merge unique
-        seen = set([x.IntegerValue for x in ids_in_src])
-        for gid in grp_ids:
-            if gid.IntegerValue not in seen:
-                ids_in_src.append(gid)
-                seen.add(gid.IntegerValue)
+    grp_ids_all = []
+    seen_gid = set()
+
+    for gid in grp_ids_loc + grp_ids_mem:
+        if (
+            gid
+            and gid != ElementId.InvalidElementId
+            and gid.IntegerValue not in seen_gid
+        ):
+            grp_ids_all.append(gid)
+            seen_gid.add(gid.IntegerValue)
+
+    # Merge groups into ids_in_src
+    seen = set([x.IntegerValue for x in ids_in_src])
+    for gid in grp_ids_all:
+        if gid.IntegerValue not in seen:
+            ids_in_src.append(gid)
+            seen.add(gid.IntegerValue)
+
+    groups_found_loc = len(grp_ids_loc)
+    groups_found_mem = len(grp_ids_mem)
+    groups_found_all = len(grp_ids_all)
 
     if not ids_in_src:
         TaskDialog.Show("mirror_handler", "No elements found inside SOURCE scope box.")
@@ -913,19 +963,31 @@ def main():
         # -----------------------------------------
         # Explicit Section Recreation (always run)
         # -----------------------------------------
+        sections_found = 0
+        sections_created = 0
+        created_sections = []
+
         try:
+            # 1. Collect candidate sections intersecting SOURCE scobe box
             all_secs = FilteredElementCollector(doc).OfClass(ViewSection).ToElements()
             sec_candidates = []
+
             for vs in all_secs:
                 try:
                     if vs.IsTemplate:
                         continue
+
+                    # if you want only building sections:
                     if vs.ViewType != ViewType.Section:
                         continue
+
                     if section_intersects_scopebox(vs, src_sb):
                         sec_candidates.append(vs)
                 except Exception:
                     pass
+
+            # >>> Counter #1: right after building candidates
+            sections_found = len(sec_candidates)
 
             if sec_candidates:
                 txs = Transaction(doc, "mirror_handler: Recreate Sections")
@@ -963,6 +1025,8 @@ def main():
                                 src_vs.Id.IntegerValue, ex
                             )
                         )
+                # >>> Counter 2: right after the creation loop (before commit)
+                sections_created = len(created_sections)
 
                 txs.Commit()
 
@@ -988,6 +1052,17 @@ def main():
         cz = (created_bbox.Min.Z + created_bbox.Max.Z) * 0.5
         bbox_note = "\nNew bbox center: ({:.3f}, {:.3f}, {:.3f})".format(cx, cy, cz)
 
+    sections_found = 0
+    sections_created = 0
+    try:
+        sections_found = len(sec_candidates)
+    except Exception:
+        sections_found = 0
+    try:
+        sections_created = len(created_sections)
+    except Exception:
+        sections_created = 0
+
     msg = (
         "Mode: {0}\nCopy mode: {1}\n"
         "Created: {2}\n"
@@ -996,20 +1071,30 @@ def main():
         "Assemblies expanded: {5}\n"
         "Hard skipped (preflight): {6}\n"
         "Plane normal: ({7:.3f},{8:.3f},{9:.3f}){10}\n"
-        "Run error samples: {11}".format(
-            mode,
-            "Create copy" if do_copy else "In-place",
-            mirrored,
-            failures,
-            skipped_group_members,
-            expanded_assembly,
-            len(hard_skipped),
-            plane.Normal.X,
-            plane.Normal.Y,
-            plane.Normal.Z,
-            bbox_note,
-            "\n- " + "\n- ".join(run_errors[:10]) if run_errors else "None",
-        )
+        "Run error samples: {11}\n"
+        "Groups found (by location): {12}\n"
+        "Groups found (by member): {13}\n"
+        "Groups merged (unique): {14}\n"
+        "Sections found: {15}\n"
+        "Sections created: {16}\n"
+    ).format(
+        mode,
+        "Create copy" if do_copy else "In-place",
+        mirrored,
+        failures,
+        skipped_group_members,
+        expanded_assembly,
+        len(hard_skipped),
+        plane.Normal.X,
+        plane.Normal.Y,
+        plane.Normal.Z,
+        bbox_note,
+        ("\n- " + "\n- ".join(run_errors[:10])) if run_errors else "None",
+        groups_found_loc,
+        groups_found_mem,
+        groups_found_all,
+        sections_found,
+        sections_created,
     )
     TaskDialog.Show("mirror_handler", msg)
 
