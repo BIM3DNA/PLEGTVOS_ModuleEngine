@@ -4,10 +4,10 @@ __doc__ = """Version = 1.0
 Date    = 16.01.2025
 ________________________________________________________________
 Description:
+Apply configure slopes to pipes/flex pipes/round ducts inside a picked scope box,
+based on group type name / assembly name rules.
 
-________________________________________________________________
-How-To:
-
+Default mode: Scope Box selection (safe).
 ________________________________________________________________
 Author: Emin Avdovic"""
 
@@ -16,8 +16,10 @@ Author: Emin Avdovic"""
 # ==================================================
 from Autodesk.Revit.DB import *
 from Autodesk.Revit.DB import (
+    AssemblyInstance,
     BuiltInCategory,
     BuiltInParameter,
+    Category,
     DWGExportOptions,
     ElementId,
     FamilySymbol,
@@ -30,15 +32,21 @@ from Autodesk.Revit.DB import (
     FilterStringBeginsWith,
     FilterStringContains,
     FilterStringEquals,
-    XYZ,
-    Transaction,
+    Group,
+    GroupType,
     TextNote,
     TextNoteType,
     TextNoteOptions,
+    Transaction,
+    TransactionGroup,
     IndependentTag,
     ImageExportOptions,
     ImageFileType,
     ImageResolution,
+    LocationCurve,
+    LocationPoint,
+    Line,
+    MEPCurve,
     UV,
     UnitTypeId,
     Reference,
@@ -58,7 +66,7 @@ from Autodesk.Revit.DB import (
     ScheduleSortOrder,
     StorageType,
     SectionType,
-    Category,
+    XYZ,
 )
 from Autodesk.Revit.UI.Selection import ObjectType, ISelectionFilter
 from Autodesk.Revit.UI import *
@@ -69,6 +77,7 @@ from Autodesk.Revit.DB.Structure import *
 from Autodesk.Revit.Exceptions import *
 from Autodesk.Revit.Attributes import *
 from Autodesk.Revit.Exceptions import ArgumentException
+from Autodesk.Revit.Exceptions import OperationCanceledException
 from System.Collections.Generic import List as ClrList
 
 import clr
@@ -124,6 +133,7 @@ import math, re, sys
 # ==================================================
 app = __revit__.Application
 uidoc = __revit__.ActiveUIDocument
+doc = uidoc.Document
 
 # VERBOSE = False
 
@@ -146,22 +156,77 @@ except ImportError:
 # Main Code
 # ==================================================
 
-# --- Constrants ---
 
-SLOPE_HWA = 0.0075  # 7.5 mm / 1000 mm
-SLOPE_VWA = 0.0050  # 5.0 mm / 1000 mm
+# --- Selection ---
+class ScopeBoxSelectionFilter(ISelectionFilter):
+    def AllowElement(self, elem):
+        try:
+            return elem.Category and elem.Category.Id.IntegerValue == int(
+                BuiltInCategory.OST_VolumeOfInterest
+            )
+        except Exception:
+            return False
 
-HWA_GROUP_NAME = "HWA Option A"
-VWA_GROUP_NAME = "VWA Option A"
+    def AllowReference(self, ref, point):
+        return False
 
-HWA_ASM_NAME_TOKEN = "Flex Pipes Assembly HWA Option A"
-VWA_ASM_NAME_TOKEN = "BG GC01"
 
-PIPE_TYPE_TOKEN = "NLRS_52_PI_PVC U3 Grijs OD_Dyka"
-FLEX_TYPE_TOKEN = "Flex - Round"
-DUCT_TYPE_TOKEN = "DYKA AIR Buis Rond"
+def pick_scopebox(prompt):
+    try:
+        ref = uidoc.Selection.PickObject(
+            ObjectType.Element, ScopeBoxSelectionFilter(), prompt
+        )
+        return doc.GetElement(ref.ElementId)
+    except OperationCanceledException:
+        return None
 
-# --- Helpers ---
+
+# --- Geometry helpers (scope box intersection) ---
+def _to_local_xyz(Tinv, p):
+    return Tinv.OfPoint(p)
+
+
+def _bbox_intersects_scopebox(elem, sb):
+    """AABB overlap in scope-box local coord (fast + robust)."""
+    try:
+        ebb = elem.get_BoundingBox(None)
+        sbb = sb.get_BoundingBox(None)
+        if not ebb or not sbb or not sbb.Transform:
+            return False
+
+        Tinv = sbb.Transform.Inverse
+
+        pts = [
+            _to_local_xyz(Tinv, XYZ(ebb.Min.X, ebb.Min.Y, ebb.Min.Z)),
+            _to_local_xyz(Tinv, XYZ(ebb.Min.X, ebb.Min.Y, ebb.Max.Z)),
+            _to_local_xyz(Tinv, XYZ(ebb.Min.X, ebb.Max.Y, ebb.Min.Z)),
+            _to_local_xyz(Tinv, XYZ(ebb.Min.X, ebb.Max.Y, ebb.Max.Z)),
+            _to_local_xyz(Tinv, XYZ(ebb.Max.X, ebb.Min.Y, ebb.Min.Z)),
+            _to_local_xyz(Tinv, XYZ(ebb.Max.X, ebb.Min.Y, ebb.Max.Z)),
+            _to_local_xyz(Tinv, XYZ(ebb.Max.X, ebb.Max.Y, ebb.Min.Z)),
+            _to_local_xyz(Tinv, XYZ(ebb.Max.X, ebb.Max.Y, ebb.Max.Z)),
+        ]
+
+        mn = XYZ(min(p.X for p in pts), min(p.Y for p in pts), min(p.Z for p in pts))
+        mx = XYZ(max(p.X for p in pts), max(p.Y for p in pts), max(p.Z for p in pts))
+
+        sb_mn = sbb.Min
+        sb_mx = sbb.Max
+
+        if mx.X < sb_mn.X or mn.X > sb_mx.X:
+            return False
+        if mx.Y < sb_mn.Y or mn.Y > sb_mx.Y:
+            return False
+        if mx.Z < sb_mn.Z or mn.Z > sb_mx.Z:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+# --- Classification rules ---
+SLOPE_75 = 0.0075  # 7.5 mm / 1000 mm
+SLOPE_50 = 0.0050  # 5.0 mm / 1000 mm
 
 
 def _safe_name(e):
@@ -171,147 +236,286 @@ def _safe_name(e):
         return ""
 
 
-def get_elem_type_name(doc, e):
+def _group_type_name(group_inst):
     try:
-        tid = e.GetTypeId()
-        t = doc.GetElement(tid) if tid and tid != ElementId.InvalidElementId else None
-        return _safe_name(t)
+        gt = doc.GetElement(group_inst.GetTypeId())
+        return _safe_name(gt)
     except Exception:
         return ""
 
 
-def get_group_slope(doc, e):
+def _assembly_name_for_member(elem):
+    """Try to recover assembly instance name/type for a member element."""
     try:
-        gid = getattr(e, "GroupId", ElementId.InvalidElementId)
-        if not gid or gid == ElementId.InvalidElementId:
-            return None
-        g = doc.GetElement(gid)
-        if not g:
-            return None
-        gt = g.GroupType
-        gname = _safe_name(gt)
-        if HWA_GROUP_NAME in gname:
-            return SLOPE_HWA
-        elif VWA_GROUP_NAME in gname:
-            return SLOPE_VWA
+        aid = getattr(elem, "AssemblyInstanceId", ElementId.InvalidElementId)
+        if aid and aid != ElementId.InvalidElementId:
+            asm = doc.GetElement(aid)
+            if asm and asm.IsValidObject:
+                # AssemblyInstance.Name often contains instance name; type name may be relevant too
+                tname = ""
+                try:
+                    t = doc.GetElement(asm.GetTypeId())
+                    tname = _safe_name(t)
+                except Exception:
+                    pass
+                return (_safe_name(asm) + " " + tname).strip()
     except Exception:
         pass
-    return None
+    return ""
 
 
-def get_assembly_slope(doc, e):
-    # Works for many elements: AssemblyInstanceId on element
+def classify_slope(elem):
+    """Return (slope_ratio, reason_string) or (None, reason_string).
+    Precedence: Group rules > Assembly rules > None.
+    """
+    # Group-driven rules (highest precedence)
     try:
-        aid = getattr(e, "AssemblyInstanceId", ElementId.InvalidElementId)
-        if not aid or aid == ElementId.InvalidElementId:
-            return None
-        asm = doc.GetElement(aid)
-        if not asm:
-            return None
-        # Assembly Instance name/type strings vary; we do token matching
-        n = _safe_name(asm)
-        # some builds store type name differently; this is best-effort
-        if HWA_ASM_NAME_TOKEN in n:
-            return SLOPE_HWA
-        elif VWA_ASM_NAME_TOKEN in n:
-            return SLOPE_VWA
+        gid = getattr(elem, "GroupId", ElementId.InvalidElementId)
+        if gid and gid != ElementId.InvalidElementId:
+            ginst = doc.GetElement(gid)
+            if ginst and ginst.IsValidObject:
+                gtn = _group_type_name(ginst).lower()
+                if "hwa option a" in gtn:
+                    return (SLOPE_75, "group:HWA Option A")
+                if "vwa option a" in gtn:
+                    return (SLOPE_50, "group:VWA Option A")
     except Exception:
         pass
-    return None
+
+    # Assembly-driven rules
+    an = _assembly_name_for_member(elem).lower()
+    if an:
+        if "flex pipes assembly hwa option a" in an:
+            return (SLOPE_75, "assembly:Flex Pipes HWA Option A")
+        if "bg gc01" in an:
+            return (SLOPE_50, "assembly:BG GC01")
+
+    return (None, "unclassified")
 
 
-def get_target_slope(doc, e):
-    # Priority: group > assembly > type/category fallback
-    s = get_group_slope(doc, e)
-    if s is not None:
-        return s
-    s = get_assembly_slope(doc, e)
-    if s is not None:
-        return s
-
-    # fallback by type name token
-    tname = get_elem_type_name(doc, e)
-    if PIPE_TYPE_TOKEN in tname or FLEX_TYPE_TOKEN in tname or DUCT_TYPE_TOKEN in tname:
-        # If you truly need to distinguish HWA vs VWA outside containers,
-        # you must add a rule here (e.g., by workset, level, system name, etc.)
-        return None
-    return None
+# --- Slope application (geometry-level) ---
+def horiz_length(p0, p1):
+    dx = p1.X - p0.X
+    dy = p1.Y - p0.Y
+    return math.sqrt(dx * dx + dy * dy)
 
 
-# --- Actual solver for single element ---
-
-
-def is_mep_curve(e):
-    try:
-        return isinstance(e.Location, LocationCurve) and e.Location.Curve is not None
-    except Exception:
-        return False
-
-
-def set_line_slope_keep_xy(e, slope_ratio, keep_end="start"):
+def set_curve_slope_keep_high_end(elem, slope_ratio):
     """
-    keep_end: 'start; keeps start Z and adjusts end Z downward / upward to match slope 'end' keeps end Z and adjusts start
+    Enforce slope magnitude by keeping higher endpoint fixed and lowering the other.
+    Works best on straight MEPCurves.
     """
-    lc = e.Location
-    crv = lc.Curve
-    if not isinstance(crv, Line):
-        return Exception("Non-line curve; skip")
+    loc = getattr(elem, "Location", None)
+    if not isinstance(loc, LocationCurve):
+        raise Exception("No LocationCurve")
 
+    crv = loc.Curve
     p0 = crv.GetEndPoint(0)
     p1 = crv.GetEndPoint(1)
 
-    # horizontal distance in XY
-    dx = p1.X - p0.X
-    dy = p1.Y - p0.Y
-    horiz = math.sqrt(dx * dx + dy * dy)
-    if horiz < 1e-6:
-        raise Exception("Zero horizontal length; skip")
+    hl = horiz_length(p0, p1)
+    if hl < 1e-6:
+        raise Exception("Too short (horiz length ~0)")
 
-    drop = slope_ratio * horiz  # feet
+    drop = slope_ratio * hl  # feet (unitless ratio * feet)
 
-    # Convention: "slope down along direction from start > end"
-    if keep_end == "start":
-        new_p0 = XYZ(p0.X, p0.Y, p0.Z)
-        new_p1 = XYZ(p1.X, p1.Y, p0.Z - drop)
-    else:  # keep end
-        new_p1 = XYZ(p1.X, p1.Y, p1.Z)
-        new_p0 = XYZ(p0.X, p0.Y, p1.Z + drop)
+    # Determine which end is higher
+    if p0.Z >= p1.Z:
+        high = p0
+        low = p1
+        high_idx = 0
+    else:
+        high = p1
+        low = p0
+        high_idx = 1
 
-    lc.Curve = Line.CreateBound(new_p0, new_p1)
+    new_low = XYZ(low.X, low.Y, high.Z - drop)
+
+    # Preserve endpoint ordering in the new curve
+    if isinstance(crv, Line):
+        if high_idx == 0:
+            new_crv = Line.CreateBound(high, new_low)
+        else:
+            new_crv = Line.CreateBound(new_low, high)
+        loc.Curve = new_crv
+        return
+
+    # Fallback attempt for non-lines: try to rebuild as a line between endpoint
+    # (better than no-op; we will refine after we see your failures list)
+    if high_idx == 0:
+        loc.Curve = Line.CreateBound(high, new_low)
+    else:
+        loc.Curve = Line.CreateBound(new_low, high)
 
 
-# --- Group handling ---
-
-
-def edit_group_apply_slope(doc, group_inst, slope_ratio, results_log):
-    ges = GroupEditScope(doc, "SlopeSolver: Edit Group")
-    gdoc = None
+def achieved_slope_ratio(elem):
+    """Return abs(dZ)/horizontal_length, or None if not measurable"""
     try:
-        gdoc = ges.Start(
-            group_inst.Id
-        )  # returns a document-like context in most builds
-        # In some versions, you still modify via `doc` while in scope; test in your environment
-        # To keep it pragmatic, use doc.GetElement(memeberId) and try edits.
-        for mid in group_inst.GetMemberIds():
-            e = doc.GetElement(mid)
-            if not e or not e.IsValidObject:
-                continue
-            if not is_mep_curve(e):
-                continue
-            try:
-                set_line_slope_keep_xy(e, slope_ratio, keep_end="start")
-                results_log["group_modified"] += 1
-            except Exception as ex:
-                results_log["group_failed"] += 1
-                results_log["errors"].append(
-                    "Group member {}: {}".format(mid.IntegerValue, ex)
-                )
-        ges.Assimilate()
-    except Exception as ex:
-        results_log["errors"].append(
-            "Group {} edit failed: {}".format(group_inst.Id.IntegerValue, ex)
-        )
+        loc = getattr(elem, "Location", None)
+        if not isinstance(loc, LocationCurve):
+            return None
+        crv = loc.Curve
+        p0 = crv.GetEndPoint(0)
+        p1 = crv.GetEndPoint(1)
+        hl = horiz_length(p0, p1)
+        if hl < 1e-6:
+            return None
+        return abs(p1.Z - p0.Z) / hl
+    except Exception:
+        return None
+
+
+# --- Collection ---
+
+
+def collect_candidates_in_scopebox(sb):
+    """
+    Collect Pipes + Flex Pipes + Ducts by category (robust acress Revit versions/IronPython)
+    """
+    cats = [
+        BuiltInCategory.OST_PipeCurves,
+        BuiltInCategory.OST_FlexPipeCurves,
+        BuiltInCategory.OST_DuctCurves,
+    ]
+
+    inside = []
+    for bic in cats:
         try:
-            ges.RollBack()
+            elems = (
+                FilteredElementCollector(doc)
+                .OfCategory(bic)
+                .WhereElementIsNotElementType()
+                .ToElements()
+            )
+        except Exception:
+            continue
+
+        for e in elems:
+            try:
+                if _bbox_intersects_scopebox(e, sb):
+                    inside.append(e)
+            except Exception:
+                pass
+
+    return inside
+
+
+# --- MAIN ---
+
+
+def main():
+    sb = pick_scopebox("Pick scope box (slope solving region)")
+    if not sb:
+        TaskDialog.Show("slope_solver", "Cancelled by user (no scope box picked).")
+        return
+
+    candidates = collect_candidates_in_scopebox(sb)
+    if not candidates:
+        TaskDialog.Show(
+            "slope_solver", "No pipe/flex pipe/duct candidates found in scope box."
+        )
+        return
+
+    # Partition by group instance (so we can use GroupEditScope for each group)
+    skipped_in_group = 0  # gid_int > list(elem)
+    non_group = []
+
+    # Counters / diagnostics
+    classified_75 = 0
+    classified_50 = 0
+    unclassified = 0
+
+    for e in candidates:
+        slope, reason = classify_slope(e)
+        if slope is None:
+            unclassified += 1
+            continue
+
+        if abs(slope - SLOPE_75) < 1e-9:
+            classified_75 += 1
+        elif abs(slope - SLOPE_50) < 1e-9:
+            classified_50 += 1
+
+        gid = getattr(e, "GroupId", ElementId.InvalidElementId)
+        if gid and gid != ElementId.InvalidElementId:
+            skipped_in_group += 1
+            continue
+
+        non_group.append(e)
+
+    # --- Execution (single undo) ---
+    tg = TransactionGroup(doc, "slope_solver: Apply Slopes")
+    tg.Start()
+
+    changed = 0
+    failed = 0
+    failures = []  # small sample for dialog
+
+    try:
+        txn = Transaction(doc, "slope_solver: Non-group")
+        txn.Start()
+
+        for e in non_group:
+            try:
+                slope, reason = classify_slope(e)
+                if slope is None:
+                    continue
+                target = slope
+                set_curve_slope_keep_high_end(e, slope)
+
+                actual = achieved_slope_ratio(e)
+                if actual is None or abs(actual - target) > 1e-4:
+                    failed += 1
+                    if len(failures) < 30:
+                        failures.append(
+                            "Slope mismatch (elem {}): target {:.6f}, actual {}".format(
+                                e.Id.IntegerValue,
+                                target,
+                                (
+                                    "{:.6f}".format(actual)
+                                    if actual is not None
+                                    else "None"
+                                ),
+                            )
+                        )
+                else:
+                    changed += 1
+            except Exception as ex:
+                failed += 1
+                if len(failures) < 30:
+                    failures.append("Elem {}: {}".format(e.Id.IntegerValue, ex))
+        txn.Commit()
+        tg.Assimilate()
+
+    except Exception:
+        try:
+            tg.RollBack()
         except Exception:
             pass
+        raise
+    # Report
+    msg = (
+        "Scope candidates: {0}\n"
+        "Classified 7.5%: {1}\n"
+        "Classified 5.0%: {2}\n"
+        "Unclassified (skipped): {3}\n"
+        "Skipped (in group): {4}\n\n"
+        "Changed: {5}\n"
+        "Failed: {6}\n\n"
+        "Failure samples:\n- {7}"
+    ).format(
+        len(candidates),
+        classified_75,
+        classified_50,
+        unclassified,
+        skipped_in_group,
+        changed,
+        failed,
+        "\n- ".join(failures) if failures else "None",
+    )
+
+    TaskDialog.Show("slope_solver", msg)
+
+
+if __name__ == "__main__":
+    main()
