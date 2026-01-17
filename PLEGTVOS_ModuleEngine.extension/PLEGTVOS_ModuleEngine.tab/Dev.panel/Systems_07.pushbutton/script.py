@@ -24,6 +24,8 @@ from Autodesk.Revit.DB import (
     ElementId,
     FamilySymbol,
     FamilyInstance,
+    FailureProcessingResult,
+    FailureSeverity,
     FBXExportOptions,
     FilteredElementCollector,
     FormatOptions,
@@ -43,6 +45,7 @@ from Autodesk.Revit.DB import (
     ImageExportOptions,
     ImageFileType,
     ImageResolution,
+    IFailuresPreprocessor,
     LocationCurve,
     LocationPoint,
     Line,
@@ -365,6 +368,157 @@ def achieved_slope_ratio(elem):
         return None
 
 
+# --- Helpers ---
+
+
+def _param(elem, bip):
+    try:
+        p = elem.get_Parameter(bip)
+        return p if p and not p.IsReadOnly else None
+    except Exception:
+        return None
+
+
+def _try_set_offsets_for_slope(elem, slope_ratio):
+    """
+    Apply slope by editing Start/End Offset parameters (preferred for Pipe/Duct).
+    Keeps the higher endpoint offset and lowers the other.
+    Returns True if something was set, else False.
+    """
+    loc = getattr(elem, "Location", None)
+    if not isinstance(loc, LocationCurve):
+        return False
+    crv = loc.Curve
+    p0 = crv.GetEndPoint(0)
+    p1 = crv.GetEndPoint(1)
+
+    hl = horiz_length(p0, p1)
+    if hl < 1e-6:
+        return False
+
+    drop = slope_ratio * hl  # feet
+
+    # Determine which endpoint is higher in Z
+    if p0.Z >= p1.Z:
+        high_idx = 0
+    else:
+        high_idx = 1
+
+    # Offsets (pipes and ducts share these built-ins in most versions)
+    p_start = _param(elem, BuiltInParameter.RBS_START_OFFSET_PARAM)
+    p_end = _param(elem, BuiltInParameter.RBS_END_OFFSET_PARAM)
+
+    if not p_start or not p_end:
+        return False
+
+    start_off = p_start.AsDouble()
+    end_off = p_end.AsDouble()
+
+    if high_idx == 0:
+        # start is high, end is low
+        p_start.Set(start_off)  # keep
+        p_end.Set(start_off - drop)  # enforce drop
+    else:
+        # end is high, start is low
+        p_end.Set(end_off)  # keep
+        p_start.Set(end_off - drop)  # enforce drop
+
+    return True
+
+
+def _try_set_slope_param(elem, slope_ratio):
+    """
+    Best-effort set of a slope parameter if present (some templates expose it).
+    Returns True if set.
+    """
+    # Pipes typically expose RBS_PIPE_SLOPE_PARAM; ducts may expose similar.
+    # Not all templates/versions expose these as writable
+    bip_names = [
+        "RBS_PIPE_SLOPE",  # may or may not exist
+        "RBS_PIPE_SLOPE_PARAM",  # may or may not exist
+        "RBS_DUCT_SLOPE",  # may or may not exist
+        "RBS_DUCT_SLOPE_PARAM",  # may or may not exist
+    ]
+
+    for name in bip_names:
+        bip = getattr(BuiltInParameter, name, None)
+        if bip is None:
+            continue
+        try:
+            p = _param(elem, bip)
+            if p:
+                p.Set(slope_ratio)
+                return True
+        except Exception:
+            pass
+
+    # fallback by parameter name (depends on template/locale)
+    try:
+        p = elem.LookupParameter("Slope")
+        if p and not p.IsReadOnly:
+            p.Set(slope_ratio)
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def apply_slope_mep_safe(elem, slope_ratio):
+    """
+    Preferred slope application:
+    1) Offsets
+    2) Slope Parameter (if any)
+    3) Last Resort: Rewritee Curve
+    """
+    did = False
+    # 1) offsets (most stable)
+    if _try_set_offsets_for_slope(elem, slope_ratio):
+        did = True
+
+    # 2) slope param (optional)
+    _try_set_slope_param(elem, slope_ratio)
+
+    # 3) last resort curve edit (avoid unless absolutely needed)
+    if not did:
+        set_curve_slope_keep_high_end(elem, slope_ratio)
+        did = True
+
+    return did
+
+
+class RollbackOnMEPFailures(IFailuresPreprocessor):
+    def __init__(self, err_log):
+        self.err_log = err_log
+
+    def PreprocessFailures(self, fa):
+        try:
+            msgs = fa.GetFailureMessages()
+            for m in msgs:
+                sev = m.GetSeverity()
+                if sev == FailureSeverity.Warning:
+                    # safe: remove warnings
+                    fa.DeleteWarning(m)
+                else:
+                    # log the real error text and rollback
+                    try:
+                        self.err_log.append(m.GetDescriptionText())
+                    except Exception:
+                        self.err_log.append("Non-warning failure (no description).")
+                    return FailureProcessingResult.ProceedWithRollBack
+            return FailureProcessingResult.Continue
+        except Exception:
+            return FailureProcessingResult.ProceedWithRollBack
+
+
+def set_failure_opts(tx, err_log):
+    """Attch failure preprocessor to a Transaction (not SubTransaction)"""
+    opts = tx.GetFailureHandlingOptions()
+    opts.SetFailuresPreprocessor(RollbackOnMEPFailures(err_log))
+    opts.SetClearAfterRollback(True)
+    tx.SetFailureHandlingOptions(opts)
+
+
 # --- Collection ---
 
 
@@ -452,39 +606,56 @@ def main():
     failures = []  # small sample for dialog
 
     try:
-        txn = Transaction(doc, "slope_solver: Non-group")
-        txn.Start()
-
         for e in non_group:
+            txe = Transaction(doc, "slope_solver: elem {}".format(e.Id.IntegerValue))
+            started = False
             try:
+                txe.Start()
+                started = True
+                set_failure_opts(txe, failures)  # failures list can store strings
+
                 slope, reason = classify_slope(e)
                 if slope is None:
+                    txe.RollBack()
                     continue
-                target = slope
-                set_curve_slope_keep_high_end(e, slope)
 
+                target = slope
+
+                # IMPORTANT: use MEP-safe applier
+                apply_slope_mep_safe(e, target)
+
+                st = txe.Commit()
+                if st != TransactionStatus.Committed:
+                    failed += 1
+                    if len(failures) < 30:
+                        failures.append(
+                            "TX not commited (elem {})".format(e.Id.IntegerValue)
+                        )
+                    continue
+
+                # Validate AFTER commit
                 actual = achieved_slope_ratio(e)
                 if actual is None or abs(actual - target) > 1e-4:
                     failed += 1
                     if len(failures) < 30:
                         failures.append(
                             "Slope mismatch (elem {}): target {:.6f}, actual {}".format(
-                                e.Id.IntegerValue,
-                                target,
-                                (
-                                    "{:.6f}".format(actual)
-                                    if actual is not None
-                                    else "None"
-                                ),
+                                e.Id.IntegerValue, target, actual
                             )
                         )
                 else:
                     changed += 1
+
             except Exception as ex:
                 failed += 1
                 if len(failures) < 30:
                     failures.append("Elem {}: {}".format(e.Id.IntegerValue, ex))
-        txn.Commit()
+                try:
+                    if started:
+                        txe.RollBack()
+                except Exception:
+                    pass
+
         tg.Assimilate()
 
     except Exception:
@@ -493,6 +664,7 @@ def main():
         except Exception:
             pass
         raise
+
     # Report
     msg = (
         "Scope candidates: {0}\n"
