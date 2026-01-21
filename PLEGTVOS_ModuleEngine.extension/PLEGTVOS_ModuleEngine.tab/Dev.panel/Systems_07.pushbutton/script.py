@@ -26,6 +26,7 @@ Author: Emin Avdovic
 from Autodesk.Revit.DB import (
     BuiltInCategory,
     BuiltInParameter,
+    BoundingBoxIntersectsFilter,
     ElementId,
     FailureProcessingResult,
     FailureSeverity,
@@ -33,6 +34,7 @@ from Autodesk.Revit.DB import (
     IFailuresPreprocessor,
     Line,
     LocationCurve,
+    Outline,
     Transaction,
     TransactionGroup,
     XYZ,
@@ -40,7 +42,9 @@ from Autodesk.Revit.DB import (
 from Autodesk.Revit.UI import TaskDialog
 from Autodesk.Revit.UI.Selection import ObjectType, ISelectionFilter
 from Autodesk.Revit.Exceptions import OperationCanceledException
-from System.Collections.Generic import List as ClrList
+from collections import defaultdict
+
+# from System.Collections.Generic import List as ClrList
 
 import math
 import re
@@ -54,15 +58,17 @@ doc = uidoc.Document
 # ==================================================
 # Config
 # ==================================================
-PIPE_TYPE_TOKEN = "nlrs_52_pi_pvc u3 grijs od_dyka"
+PIPE_TYPE_ID = 926396
 
 # Match by substring (case-insensitive) within MEPSystem.Name
-SYS_SLOPE_RULES = [
-    ("51 - VWA 2", 0.0075),  # 5%
-    ("50 - HWA 4", 0.005),  # 7.5%
-]
+# SYS_SLOPE_RULES = [
+#     ("51 - VWA 2", 0.0075),  # 5%
+#     ("50 - HWA 4", 0.005),  # 7.5%
+# ]
+SLOPE_VWA = 0.0075  # 7.5%
+SLOPE_HWA = 0.005  # 5%
 
-# Validation tolerance (ratio units, e.g. 0.05 == 5%)
+# Validation tolerance (ratio units, p.g. 0.05 == 5%)
 SLOPE_TOL = 1e-4
 
 
@@ -103,6 +109,9 @@ def _bbox_intersects_scopebox(elem, sb):
     """AABB overlap in scope-box local coord (fast + robust)."""
     try:
         ebb = elem.get_BoundingBox(None)
+        if not ebb:
+            ebb = elem.get_BoundingBox(doc.ActiveView)
+
         sbb = sb.get_BoundingBox(None)
         if not ebb or not sbb or not sbb.Transform:
             return False
@@ -110,14 +119,22 @@ def _bbox_intersects_scopebox(elem, sb):
         Tinv = sbb.Transform.Inverse
 
         pts = [
-            _to_local_xyz(Tinv, XYZ(ebb.Min.X, ebb.Min.Y, ebb.Min.Z)),
-            _to_local_xyz(Tinv, XYZ(ebb.Min.X, ebb.Min.Y, ebb.Max.Z)),
-            _to_local_xyz(Tinv, XYZ(ebb.Min.X, ebb.Max.Y, ebb.Min.Z)),
-            _to_local_xyz(Tinv, XYZ(ebb.Min.X, ebb.Max.Y, ebb.Max.Z)),
-            _to_local_xyz(Tinv, XYZ(ebb.Max.X, ebb.Min.Y, ebb.Min.Z)),
-            _to_local_xyz(Tinv, XYZ(ebb.Max.X, ebb.Min.Y, ebb.Max.Z)),
-            _to_local_xyz(Tinv, XYZ(ebb.Max.X, ebb.Max.Y, ebb.Min.Z)),
-            _to_local_xyz(Tinv, XYZ(ebb.Max.X, ebb.Max.Y, ebb.Max.Z)),
+            Tinv.OfPoint,
+            (XYZ(ebb.Min.X, ebb.Min.Y, ebb.Min.Z)),
+            Tinv.OfPoint,
+            (XYZ(ebb.Min.X, ebb.Min.Y, ebb.Max.Z)),
+            Tinv.OfPoint,
+            (XYZ(ebb.Min.X, ebb.Max.Y, ebb.Min.Z)),
+            Tinv.OfPoint,
+            (XYZ(ebb.Min.X, ebb.Max.Y, ebb.Max.Z)),
+            Tinv.OfPoint,
+            (XYZ(ebb.Max.X, ebb.Min.Y, ebb.Min.Z)),
+            Tinv.OfPoint,
+            (XYZ(ebb.Max.X, ebb.Min.Y, ebb.Max.Z)),
+            Tinv.OfPoint,
+            (XYZ(ebb.Max.X, ebb.Max.Y, ebb.Min.Z)),
+            Tinv.OfPoint,
+            (XYZ(ebb.Max.X, ebb.Max.Y, ebb.Max.Z)),
         ]
 
         mn = XYZ(min(p.X for p in pts), min(p.Y for p in pts), min(p.Z for p in pts))
@@ -135,6 +152,79 @@ def _bbox_intersects_scopebox(elem, sb):
         return True
     except Exception:
         return False
+
+
+def _scopebox_outline_model(sb):
+    sbb = sb.get_BoundingBox(None)
+    if not sbb:
+        sbb = sb.get_BoundingBox(doc.ActiveView)
+    if not sbb:
+        return None
+
+    T = sbb.Transform
+    mn = sbb.Min
+    mx = sbb.Max
+
+    # If transform exists, map 8 corners to model coords and rebuild AABB
+    if T:
+        pts = [
+            T.OfPoint(XYZ(mn.X, mn.Y, mn.Z)),
+            T.OfPoint(XYZ(mn.X, mn.Y, mx.Z)),
+            T.OfPoint(XYZ(mn.X, mx.Y, mn.Z)),
+            T.OfPoint(XYZ(mn.X, mx.Y, mx.Z)),
+            T.OfPoint(XYZ(mx.X, mn.Y, mn.Z)),
+            T.OfPoint(XYZ(mx.X, mn.Y, mx.Z)),
+            T.OfPoint(XYZ(mx.X, mx.Y, mn.Z)),
+            T.OfPoint(XYZ(mx.X, mx.Y, mx.Z)),
+        ]
+        mn_m = XYZ(min(p.X for p in pts), min(p.Y for p in pts), min(p.Z for p in pts))
+        mx_m = XYZ(max(p.X for p in pts), max(p.Y for p in pts), max(p.Z for p in pts))
+        return Outline(mn_m, mx_m)
+
+    return Outline(mn, mx)
+
+
+# ==================================================
+# Classification by Pipe Type + MEPSystem.Name
+# ==================================================
+def get_pipe_type_name(p):
+    try:
+        t = doc.GetElement(p.GetTypeId())
+        if not t:
+            return ""
+
+        n = getattr(t, "Name", None)
+        if n:
+            return n
+
+        pn = t.get_Parameter(BuiltInParameter.SYMBOL_NAME_PARAM)
+        if pn:
+            s = pnAsString()
+            if s:
+                return s
+    except Exception:
+        pass
+    return ""
+
+
+def get_system_name(pipe):
+    try:
+        p = pipe.get_Parameter(BuiltInParameter.RBS_SYSTEM_NAME_PARAM)
+        if p:
+            return (p.AsString() or "").strip()
+    except Exception:
+        pass
+    return ""
+
+
+def classify_target_slope(pipe):
+    sysname = get_system_name(pipe)
+    low = re.sub(r"\s+", " ", (sysname or "").strip().lower())
+    if "51 - vwa" in low:
+        return (SLOPE_VWA, sysname)
+    if "50 - hwa" in low:
+        return (SLOPE_HWA, sysname)
+    return (None, sysname)
 
 
 # ==================================================
@@ -163,11 +253,72 @@ def achieved_slope_ratio(elem):
         return None
 
 
+def _param(elem, bip):
+    try:
+        p = elem.get_Parameter(bip)
+        return p if p and not p.IsReadOnly else None
+    except Exception:
+        return None
+
+
+def _try_set_slope_param(elem, slope_ratio):
+    for name in ["RBS_PIPE_SLOPE_PARAM", "RBS_PIPE_SLOPE"]:
+        bip = getattr(BuiltInParameter, name, None)
+        if bip is None:
+            continue
+        try:
+            p = _param(elem, bip)
+            if p:
+                p.Set(slope_ratio)
+                return True
+        except Exception:
+            pass
+
+    # Fallback by parameter name (template/locale-dependent)
+    try:
+        p = elem.LookupParameter("Slope")
+        if p and not p.IsReadOnly:
+            p.Set(slope_ratio)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _try_set_offsets_for_slope(elem, slope_ratio):
+    loc = getattr(elem, "Location", None)
+    if not isinstance(loc, LocationCurve):
+        return False
+
+    crv = loc.Curve
+    p0 = crv.GetEndPoint(0)
+    p1 = crv.GetEndPoint(1)
+
+    hl = horiz_length(p0, p1)
+    if hl < 1e-6:
+        return False
+
+    drop = slope_ratio * hl  # feet
+
+    high_idx = 0 if p0.Z >= p1.Z else 1
+
+    p_start = _param(elem, BuiltInParameter.RBS_START_OFFSET_PARAM)
+    p_end = _param(elem, BuiltInParameter.RBS_END_OFFSET_PARAM)
+    if not p_start or not p_end:
+        return False
+
+    start_off = p_start.AsDouble()
+    end_off = p_end.AsDouble()
+
+    if high_idx == 0:
+        p_end.Set(start_off - drop)  # enforce
+    else:
+        p_start.Set(end_off - drop)  # enforce
+
+    return True
+
+
 def set_curve_slope_keep_high_end(elem, slope_ratio):
-    """
-    LAST RESORT: Rewrites LocationCurve to enforce slope magnitude.
-    Keeps higher endpoint fixed and lowers the other.
-    """
     loc = getattr(elem, "Location", None)
     if not isinstance(loc, LocationCurve):
         raise Exception("No LocationCurve")
@@ -199,111 +350,41 @@ def set_curve_slope_keep_high_end(elem, slope_ratio):
         loc.Curve = Line.CreateBound(new_low, high)
 
 
-# ==================================================
-# Parameter helpers + slope application
-# ==================================================
-def _param(elem, bip):
+def is_too_short(elem):
     try:
-        p = elem.get_Parameter(bip)
-        return p if p and not p.IsReadOnly else None
-    except Exception:
-        return None
-
-
-def _try_set_offsets_for_slope(elem, slope_ratio):
-    """
-    Apply slope by editing Start/End Offset parameters (often stable for Pipe).
-    Keeps the higher endpoint offset and lowers the other.
-    Returns True if something was set, else False.
-    """
-    loc = getattr(elem, "Location", None)
-    if not isinstance(loc, LocationCurve):
-        return False
-
-    crv = loc.Curve
-    p0 = crv.GetEndPoint(0)
-    p1 = crv.GetEndPoint(1)
-
-    hl = horiz_length(p0, p1)
-    if hl < 1e-6:
-        return False
-
-    drop = slope_ratio * hl  # feet
-
-    high_idx = 0 if p0.Z >= p1.Z else 1
-
-    p_start = _param(elem, BuiltInParameter.RBS_START_OFFSET_PARAM)
-    p_end = _param(elem, BuiltInParameter.RBS_END_OFFSET_PARAM)
-    if not p_start or not p_end:
-        return False
-
-    start_off = p_start.AsDouble()
-    end_off = p_end.AsDouble()
-
-    if high_idx == 0:
-        p_start.Set(start_off)  # keep
-        p_end.Set(start_off - drop)  # enforce
-    else:
-        p_end.Set(end_off)  # keep
-        p_start.Set(end_off - drop)  # enforce
-
-    return True
-
-
-def _try_set_slope_param(elem, slope_ratio):
-    """
-    Best-effort set of a slope parameter if present/writable.
-    Returns True if set.
-    """
-    bip_names = [
-        "RBS_PIPE_SLOPE",
-        "RBS_PIPE_SLOPE_PARAM",
-        "RBS_DUCT_SLOPE",
-        "RBS_DUCT_SLOPE_PARAM",
-    ]
-
-    for name in bip_names:
-        bip = getattr(BuiltInParameter, name, None)
-        if bip is None:
-            continue
-        try:
-            p = _param(elem, bip)
-            if p:
-                p.Set(slope_ratio)
-                return True
-        except Exception:
-            pass
-
-    # Fallback by parameter name (template/locale-dependent)
-    try:
-        p = elem.LookupParameter("Slope")
-        if p and not p.IsReadOnly:
-            p.Set(slope_ratio)
+        loc = elem.Location
+        if not isinstance(loc, LocationCurve):
             return True
+        crv = loc.Curve
+        if crv is None:
+            return True
+        # Revit tolerance in feer
+        tol = doc.Application.ShortCurveTolerance
+        if crv.Length < tol * 1.5:
+            return True
+        p0 = crv.GetEndPoint(0)
+        p1 = crv.GetEndPoint(1)
+        if horiz_length(p0, p1) < tol * 0.5:
+            return True
+        return False
     except Exception:
-        pass
-
-    return False
+        return True
 
 
 def apply_slope_mep_safe(elem, slope_ratio):
-    """
-    Preferred slope application (pragmatic):
-    1) Slope parameter (if available)
-    2) Offsets
-    3) Last resort: curve rewrite
-    """
     if _try_set_slope_param(elem, slope_ratio):
         return True
     if _try_set_offsets_for_slope(elem, slope_ratio):
         return True
-    set_curve_slope_keep_high_end(elem, slope_ratio)
-    return True
+    # set_curve_slope_keep_high_end(elem, slope_ratio)
+    return False
 
 
 # ==================================================
 # Failure handling
 # ==================================================
+
+
 class RollbackOnMEPFailures(IFailuresPreprocessor):
     def __init__(self, err_log):
         self.err_log = err_log
@@ -312,8 +393,7 @@ class RollbackOnMEPFailures(IFailuresPreprocessor):
         try:
             msgs = fa.GetFailureMessages()
             for m in msgs:
-                sev = m.GetSeverity()
-                if sev == FailureSeverity.Warning:
+                if m.GetSeverity() == FailureSeverity.Warning:
                     fa.DeleteWarning(m)
                 else:
                     try:
@@ -327,7 +407,6 @@ class RollbackOnMEPFailures(IFailuresPreprocessor):
 
 
 def set_failure_opts(tx, err_log):
-    """Attach failure preprocessor to a Transaction."""
     opts = tx.GetFailureHandlingOptions()
     opts.SetFailuresPreprocessor(RollbackOnMEPFailures(err_log))
     opts.SetClearAfterRollback(True)
@@ -335,108 +414,101 @@ def set_failure_opts(tx, err_log):
 
 
 # ==================================================
-# Classification by Pipe Type + MEPSystem.Name
-# ==================================================
-def get_pipe_type_name(p):
+# CONNECTIVITY
+# ===================================================
+
+
+def _connector_ids_for_elem(elem):
+    out = set()
     try:
-        t = doc.GetElement(p.GetTypeId())
-        if not t:
-            return ""
-
-        pn = t.get_Parameter(BuiltInParameter.SYMBOL_NAME_PARAM)
-        if pn:
-            s = pn.AsString()
-            if s:
-                return s
-
-        n = getattr(t, "Name", None)
-        if n:
-            return n
-
-        for key in ["Type Name", "Naam", "Type", "Naam Type"]:
-            pp = t.LookupParameter(key)
-            if pp:
-                s2 = pp.AsString()
-                if s2:
-                    return s2
+        cm = elem.ConnectorManager
     except Exception:
-        pass
-    return ""
-
-
-def get_system_name_and_typeid(pipe):
-    sysname = ""
-    stid = None
+        return out
 
     try:
-        p = pipe.get_Parameter(BuiltInParameter.RBS_SYSTEM_NAME_PARAM)
-        if p:
-            sysname = (p.AsString() or "").strip()
+        conns = cm.Connectors
     except Exception:
-        pass
-    try:
-        p = pipe.get_Parameter(BuiltInParameter.RBS_PIPING_SYSTEM_TYPE_PARAM)
-        if p:
-            eid = p.AsElementId()
-            if eid and eid != ElementId.InvalidElementId:
-                stid = eid.IntegerValue
-    except Exception:
-        pass
+        return out
 
-    return (sysname, stid)
+    for c in conns:
+        try:
+            refs = c.AllRefs
+        except Exception:
+            continue
+        for r in refs:
+            try:
+                owner = r.Owner
+                if owner and owner.Id and owner.Id != elem.Id:
+                    out.add(owner.Id.IntegerValue)
+            except Exception:
+                pass
+    return out
 
 
-def classify_slope_by_system(pipe):
-    """Return (slope_ratio, reason) or (None, reason)."""
-    sysname, stid = get_system_name_and_typeid(pipe)
-    low = (sysname or "").strip().lower()
-    low = re.sub(r"\s+", " ", low)  # normalize spaces
+def build_components(pipes):
+    by_id = {p.Id.IntegerValue: p for p in pipes}
 
-    # Match "51 - VWA ..." > 5%
-    if "51 - vwa" in low:
-        return (0.0075, "systemNameToken:'51 - VWA' ({})".format(sysname))
-    # Match "50 - HWA ..." > 7.5%
-    if "50 - hwa" in low:
-        return (0.005, "systemNameToken:'50 - HWA' ({})".format(sysname))
+    adj = {}
+    for pid, p in by_id.items():
+        nbrs = _connector_ids_for_elem(p)
+        adj[pid] = [nid for nid in nbrs if nid in by_id]
 
-    if not low and stid is None:
-        return (None, "no system params")
+    seen = set()
+    comps = []
 
-    return (None, "system not matched (name='{}', typeId={})".format(sysname, stid))
+    for pid in by_id:
+        if pid in seen:
+            continue
+        stack = [pid]
+        seen.add(pid)
+        comp_ids = []
+        while stack:
+            cur = stack.pop()
+            comp_ids.append(cur)
+            for nb in adj.get(cur, []):
+                if nb not in seen:
+                    seen.add(nb)
+                    stack.append(nb)
+        comps.append([by_id[i] for i in comp_ids])
+
+    return comps
 
 
 # ==================================================
-# Candidate collection
+# COLLECTION
 # ==================================================
+
+
 def collect_target_pipes_in_scopebox(sb):
-    """Collect PipeCurves in scope box, filtered by Pipe Type name."""
+    outline = _scopebox_outline_model(sb)
+    if not outline:
+        print("DEBUG: scope box has no bounding box; cannot build outline.")
+        return []
+
+    bb_filter = BoundingBoxIntersectsFilter(outline)
+
     pipes = (
         FilteredElementCollector(doc)
         .OfCategory(BuiltInCategory.OST_PipeCurves)
         .WhereElementIsNotElementType()
+        .WherePasses(bb_filter)
         .ToElements()
     )
 
     inside = []
-    debug_printed = 0
-
     for p in pipes:
         try:
-            if not _bbox_intersects_scopebox(p, sb):
+            if p.GetTypeId().IntegerValue != PIPE_TYPE_ID:
                 continue
-
-            tname = (get_pipe_type_name(p) or "").strip().lower()
-            if debug_printed < 10:
-                print("IN-SCOPE TYPE RAW:", repr(tname))
-                debug_printed += 1
-
-            if PIPE_TYPE_TOKEN not in tname:
-                continue
-
             inside.append(p)
         except Exception:
             pass
-
+    print(
+        "DEBUG totals: pipes_bb_filter=",
+        len(pipes),
+        "type_match=",
+        len(inside),
+    )
     return inside
 
 
@@ -450,92 +522,78 @@ def main():
         return
 
     candidates = collect_target_pipes_in_scopebox(sb)
-    for p in candidates[:10]:
-        sysname, stid = get_system_name_and_typeid(p)
-        print("PIPE", p.Id.IntegerValue, "SYSNAME:", repr(sysname), "SYSTYPEID:", stid)
-
     if not candidates:
         TaskDialog.Show(
             "slope_solver",
-            "No target PipeCurves found in scope box.\nType filter: {}".format(
-                PIPE_TYPE_TOKEN
+            "No target PipeCurves found in scope box.\nTypeId filter: {}".format(
+                PIPE_TYPE_ID
             ),
         )
         return
 
-    # Diagnostics
-    classified_75 = 0
-    classified_50 = 0
-    unclassified = 0
+    # Build connected components (runs
+    comps = build_components(candidates)
 
-    for e in candidates:
-        slope, _ = classify_slope_by_system(e)
-        if slope is None:
-            unclassified += 1
-        elif abs(slope - 0.005) < 1e-9:
-            classified_75 += 1
-        elif abs(slope - 0.0075) < 1e-9:
-            classified_50 += 1
-
-    # --- Execution (single undo) ---
-    tg = TransactionGroup(doc, "slope_solver: Apply Slopes (System-based)")
-    tg.Start()
-
+    # Stats
+    total = len(candidates)
     changed = 0
     failed = 0
-    failures = []  # sample lines
+    skipped = 0
+    failures = []
+
+    # --- Execution (single undo) ---
+    tg = TransactionGroup(doc, "slope_solver: Apply Slopes (component-based)")
+    tg.Start()
 
     try:
-        for e in candidates:
-            txe = Transaction(doc, "slope_solver: elem {}".format(e.Id.IntegerValue))
-            started = False
+        for i, comp in enumerate(comps):
+            tx = Transaction(doc, "slope_solver: component {}".format(i + 1))
+            tx.Start()
+            set_failure_opts(tx, failures)
+
             try:
-                txe.Start()
-                started = True
-                set_failure_opts(txe, failures)
+                any_touched = False
+                for p in comp:
+                    target, sysname = classify_target_slope(p)
+                    if target is None:
+                        skipped += 1
+                        continue
+                    apply_slope(p, target)
+                    any_touched = True
 
-                target, reason = classify_slope_by_system(e)
-                if target is None:
-                    txe.RollBack()
+                if any_touched:
+                    doc.Regenerate()
+
+                st = tx.Commit()
+                if st.ToString() != "Committed":
+                    failed += len(comp)
                     continue
 
-                apply_slope_mep_safe(e, target)
-
-                # IMPORTANT: let Revit solve connectivity while txn is open
-                doc.Regenerate()
-
-                st = txe.Commit()
-                if st != TransactionStatus.Committed:
-                    failed += 1
-                    if len(failures) < 30:
-                        failures.append(
-                            "TX not committed (elem {}): {}".format(
-                                e.Id.IntegerValue, reason
+                # Validate after commit (per pipe)
+                for p in comp:
+                    target, sysname = classify_target_slope(p)
+                    if target is None:
+                        continue
+                    actual = achieved_slope_ratio(p)
+                    if actual is None or abs(actual - target) > SLOPE_TOL:
+                        failed += 1
+                        if len(failures) < 30:
+                            failures.append(
+                                "Slope mismatch pipe {}: target {:.6f}, actual {} (sys='{}')".format(
+                                    p.Id.IntegerValue, target, actual, sysname
+                                )
                             )
-                        )
-                    continue
-
-                actual = achieved_slope_ratio(e)
-                if actual is None or abs(actual - target) > SLOPE_TOL:
-                    failed += 1
-                    if len(failures) < 30:
-                        failures.append(
-                            "Slope mismatch (elem {}): target {:.6f}, actual {} ({})".format(
-                                e.Id.IntegerValue, target, actual, reason
-                            )
-                        )
-                else:
-                    changed += 1
+                    else:
+                        changed += 1
 
             except Exception as ex:
-                failed += 1
-                if len(failures) < 30:
-                    failures.append("Elem {} failed: {}".format(e.Id.IntegerValue, ex))
                 try:
-                    if started:
-                        txe.RollBack()
+                    tx.RollBack()
                 except Exception:
                     pass
+                failed += len(comp)
+                if len(failures) < 30:
+                    failures.append("Component {} failed: {}".format(i + 1, ex))
 
         tg.Assimilate()
 
@@ -547,20 +605,18 @@ def main():
         raise
 
     msg = (
-        "Scope candidates (type-filtered): {0}\n"
-        "Classified 7.5%: {1}\n"
-        "Classified 5.0%: {2}\n"
-        "Unclassified (system not matched / no system): {3}\n\n"
-        "Changed: {4}\n"
-        "Failed: {5}\n\n"
-        "Failure samples:\n- {6}"
+        "Candidates: {0}\n"
+        "Components: {1}\n\n"
+        "Changed (validated): {2}\n"
+        "Failed (validated/tx): {3}\n"
+        "Skipped (no system match): {4}\n\n"
+        "Failure samples:\n- {5}"
     ).format(
-        len(candidates),
-        classified_75,
-        classified_50,
-        unclassified,
+        total,
+        len(comps),
         changed,
         failed,
+        skipped,
         "\n- ".join(failures) if failures else "None",
     )
 

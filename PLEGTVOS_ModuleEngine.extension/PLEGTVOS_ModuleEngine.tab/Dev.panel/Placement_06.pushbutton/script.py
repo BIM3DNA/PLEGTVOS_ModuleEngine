@@ -307,40 +307,37 @@ def scopebox_axis_world(sb, axis="X", flatten_z=True):
     return v.Normalize()
 
 
-def build_mapping_mirror_plane(src_sb, tgt_sb, mode="center"):
+def build_mapping_mirror_plane(src_sb, mode="center"):
     """
-    Builds mirror plane with normal aligned to TARGET scopebox X axis (world),
-    and origin chosen so that reflecting SOURCE center -> TARGET center."""
-    n = scopebox_axis_world(tgt_sb, axis="X", flatten_z=True)
+    Builds mirror plane using SOURCE scopebox axis (world).
+    Plane is positioned on SOURCE scopebox center/face, then
+    a follow-up translation can be applied to reach TARGET.
+    """
+    # Use SOURCE axis so mirroring is consistent with source orientation
+    n = scopebox_axis_world(src_sb, axis="X", flatten_z=True)
 
-    cS = scopebox_center_world(src_sb)
-    cT = scopebox_center_world(tgt_sb)
+    bb = src_sb.get_BoundingBox(None)
+    if not bb or not bb.Transform:
+        raise Exception("Scope box has no bounding box/transform.")
+    T = bb.Transform
+    mn = bb.Min
+    mx = bb.Max
 
-    # Choose origin so reflection maps cS -> cT:
-    # cT = cS - 2*n*(n.(cS - 0)) => n.(cS - 0) = 0.5 * n.(cS - cT)
-    d = cS - cT
-    a = 0.5 * (n.DotProduct(d))
-    o = cS - (a * n)
+    xmid = (mn.X + mx.X) * 0.5
+    ymid = (mn.Y + mx.Y) * 0.5
+    zmid = (mn.Z + mx.Z) * 0.5
 
-    # Optional: support left/right faces by shifting plane along n
-    # (using TARGET local extents projected to world)
-    if mode in ("left_face", "right_face"):
-        bb = tgt_sb.get_BoundingBox(None)
-        T = bb.Transform
-        # local X extents
-        x_face = bb.Min.X if mode == "left_face" else bb.Max.X
-        # plane point at that local x, at local center y,z
-        ymid = (bb.Min.Y + bb.Max.Y) * 0.5
-        zmid = (bb.Min.Z + bb.Max.Z) * 0.5
-        p_face_world = T.OfPoint(XYZ(x_face, ymid, zmid))
+    if mode == "left_face":
+        xplane = mn.X
+    elif mode == "right_face":
+        xplane = mx.X
+    else:
+        xplane = xmid
 
-        # We want the place to go through that face location, but still map cS -> cT
-        # If you truly want "face-based mapping", you need a consistent convention.
-        # Practical approach: replace o's projection along n to match the face:
-        # enforce n.o = n.p_face_world
-        o = o + ((n.DotProduct(p_face_world - o)) * n)
+    p_local = XYZ(xplane, ymid, zmid)
+    p_world = T.OfPoint(p_local)
 
-    return Plane.CreateByNormalAndOrigin(n, o)
+    return Plane.CreateByNormalAndOrigin(n, p_world)
 
 
 def reflect_point_about_plane(p, plane):
@@ -360,8 +357,8 @@ def reflect_vector_about_plane(v, plane):
 
 def scopebox_center_world(sb):
     bb = sb.get_BoundingBox(None)
-    if not bb:
-        raise Exception("Scope box has no bounding box.")
+    if not bb or not bb.Transform:
+        raise Exception("Scope box has no bounding box/transform.")
     T = bb.Transform
     mn, mx = bb.Min, bb.Max
     c_local = XYZ((mn.X + mx.X) * 0.5, (mn.Y + mx.Y) * 0.5, (mn.Z + mx.Z) * 0.5)
@@ -733,12 +730,20 @@ def main():
         return
 
     try:
-        plane = build_mapping_mirror_plane(src_sb, tgt_sb, mode=mode)
+        plane = build_mapping_mirror_plane(src_sb, mode=mode)
     except Exception as ex:
         TaskDialog.Show("mirror_handler", "Failed to build mirror plane: {}".format(ex))
         return
 
-    move_vec = XYZ(0, 0, 0)  # mapping plane already handles alignment
+    # Translate after mirror to align SOURCE -> TARGET centers
+    # This fixes "mirror copy ends up near source" when target is distant.
+    try:
+        cS = scopebox_center_world(src_sb)
+        cT = scopebox_center_world(tgt_sb)
+        cS_ref = reflect_point_about_plane(cS, plane)
+        move_vec = cT - cS_ref
+    except Exception:
+        move_vec = XYZ(0, 0, 0)
 
     ids = load_collected_ids()
     if not ids:
@@ -893,6 +898,18 @@ def main():
 
             if batch_ok and do_copy:
                 batch_created = list(res_ids)
+                # Move mirrored copies to TARGET if needed
+                if move_vec.GetLength() > 1e-6:
+                    try:
+                        txm = Transaction(doc, "mirror_handler: Move Batch Copy")
+                        txm.Start()
+                        set_failure_opts(txm, run_errors)
+                        ElementTransformUtils.MoveElements(
+                            doc, ClrList[ElementId](batch_created), move_vec
+                        )
+                        txm.Commit()
+                    except Exception as ex:
+                        run_errors.append("Batch move exception: {}".format(ex))
 
         except Exception as ex:
             run_errors.append("Batch exception: {}".format(ex))
@@ -934,6 +951,24 @@ def main():
                                 re = doc.GetElement(rid)
                                 if re and re.IsValidObject:
                                     created_ids.append(rid)
+                            # Move this mirrored copy to TARGET if needed
+                            if move_vec.GetLength() > 1e-6 and created_ids:
+                                try:
+                                    txm = Transaction(
+                                        doc, "mirror_handler: Move One Copy"
+                                    )
+                                    txm.Start()
+                                    set_failure_opts(txm, run_errors)
+                                    ElementTransformUtils.MoveElements(
+                                        doc,
+                                        ClrList[ElementId]([created_ids[-1]]),
+                                        move_vec,
+                                    )
+                                    txm.Commit()
+                                except Exception as ex:
+                                    run_errors.append(
+                                        "Per-element move exception: {}".format(ex)
+                                    )
 
                         if was_pinned:
                             try:
@@ -1063,6 +1098,10 @@ def main():
     except Exception:
         sections_created = 0
 
+    note = ""
+    if (not do_copy) and move_vec.GetLength() > 1e-6:
+        note = "\nNote: In-place mirror does not apply target translation."
+
     msg = (
         "Mode: {0}\nCopy mode: {1}\n"
         "Created: {2}\n"
@@ -1077,6 +1116,7 @@ def main():
         "Groups merged (unique): {14}\n"
         "Sections found: {15}\n"
         "Sections created: {16}\n"
+        "{17}"
     ).format(
         mode,
         "Create copy" if do_copy else "In-place",
@@ -1095,6 +1135,7 @@ def main():
         groups_found_all,
         sections_found,
         sections_created,
+        note,
     )
     TaskDialog.Show("mirror_handler", msg)
 
