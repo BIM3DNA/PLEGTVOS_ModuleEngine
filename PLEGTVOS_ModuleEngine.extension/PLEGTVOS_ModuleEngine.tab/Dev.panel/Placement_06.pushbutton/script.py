@@ -85,6 +85,7 @@ import subprocess
 import datetime
 import tempfile
 import json
+from collections import defaultdict
 
 
 clr.AddReference("System")
@@ -162,6 +163,12 @@ except ImportError:
 # ==================================================
 # Helpers
 # ==================================================
+
+HOST_AWARE_CATEGORIES = set(
+    [
+        "Roof Drain Plate",
+    ]
+)
 
 
 class ScopeBoxSelectionFilter(ISelectionFilter):
@@ -307,37 +314,54 @@ def scopebox_axis_world(sb, axis="X", flatten_z=True):
     return v.Normalize()
 
 
-def build_mapping_mirror_plane(src_sb, mode="center"):
-    """
-    Builds mirror plane using SOURCE scopebox axis (world).
-    Plane is positioned on SOURCE scopebox center/face, then
-    a follow-up translation can be applied to reach TARGET.
-    """
-    # Use SOURCE axis so mirroring is consistent with source orientation
-    n = scopebox_axis_world(src_sb, axis="X", flatten_z=True)
-
-    bb = src_sb.get_BoundingBox(None)
+def sb_bbox(sb):
+    bb = sb.get_BoundingBox(None)
     if not bb or not bb.Transform:
-        raise Exception("Scope box has no bounding box/transform.")
-    T = bb.Transform
-    mn = bb.Min
-    mx = bb.Max
+        return None
+    return bb
 
-    xmid = (mn.X + mx.X) * 0.5
-    ymid = (mn.Y + mx.Y) * 0.5
-    zmid = (mn.Z + mx.Z) * 0.5
 
-    if mode == "left_face":
-        xplane = mn.X
+def sb_world_center(bb):
+    c_local = XYZ(
+        (bb.Min.X + bb.Max.X) * 0.5,
+        (bb.Min.Y + bb.Max.Y) * 0.5,
+        (bb.Min.Z + bb.Max.Z) * 0.5,
+    )
+    return bb.Transform.OfPoint(c_local)
+
+
+def sb_world_face_plane(bb, mode):
+    # Build target-space plane from target Transform with world-center origin
+    half_x = 0.5 * (bb.Max.X - bb.Min.X)
+    n = bb.Transform.BasisX
+    if n.GetLength() < 1e-9:
+        n = XYZ(1, 0, 0)
+
+    if mode == "center":
+        offset = 0.0
+        n_world = n.Normalize()
     elif mode == "right_face":
-        xplane = mx.X
+        offset = half_x
+        n_world = n.Normalize()
+    elif mode == "left_face":
+        offset = -half_x
+        n_world = n.Normalize().Negate()
     else:
-        xplane = xmid
+        raise Exception("unknown mode")
 
-    p_local = XYZ(xplane, ymid, zmid)
-    p_world = T.OfPoint(p_local)
+    origin_world = sb_world_center(bb) + (n.Normalize() * offset)
+    return Plane.CreateByNormalAndOrigin(n_world, origin_world)
 
-    return Plane.CreateByNormalAndOrigin(n, p_world)
+
+def build_target_face_plane(tgt_sb, mode="center"):
+    """
+    Builds mirror plane from TARGET scopebox face/center in world space.
+    Plane passes through target face (no padding).
+    """
+    bb = sb_bbox(tgt_sb)
+    if not bb:
+        raise Exception("Scope box has no bounding box/transform.")
+    return sb_world_face_plane(bb, mode)
 
 
 def reflect_point_about_plane(p, plane):
@@ -473,6 +497,85 @@ def point_in_scopebox(p_world, sb):
     return (mn.X <= pl.X <= mx.X) and (mn.Y <= pl.Y <= mx.Y) and (mn.Z <= pl.Z <= mx.Z)
 
 
+def _safe_name(obj):
+    try:
+        return obj.Name
+    except Exception:
+        return ""
+
+
+def _cat_name(e):
+    try:
+        if e and e.Category:
+            return e.Category.Name
+    except Exception:
+        pass
+    return "Unknown"
+
+
+def _family_type_name(e):
+    try:
+        if isinstance(e, FamilyInstance):
+            sym = e.Symbol
+            if sym:
+                return "{} : {}".format(_safe_name(sym.Family), _safe_name(sym))
+    except Exception:
+        pass
+    return ""
+
+
+def _host_info(e):
+    try:
+        if isinstance(e, FamilyInstance):
+            h = e.Host
+            if h and h.IsValidObject:
+                return (h.Id.IntegerValue, _cat_name(h))
+    except Exception:
+        pass
+    return (None, "")
+
+
+def _project_points_on_axis(pts, axis):
+    mn = None
+    mx = None
+    for p in pts:
+        v = p.DotProduct(axis)
+        if mn is None or v < mn:
+            mn = v
+        if mx is None or v > mx:
+            mx = v
+    return mn, mx
+
+
+def scopebox_world_corners(sb):
+    bb = sb.get_BoundingBox(None)
+    if not bb or not bb.Transform:
+        return []
+    T = bb.Transform
+    mn = bb.Min
+    mx = bb.Max
+    return [
+        T.OfPoint(XYZ(mn.X, mn.Y, mn.Z)),
+        T.OfPoint(XYZ(mn.X, mn.Y, mx.Z)),
+        T.OfPoint(XYZ(mn.X, mx.Y, mn.Z)),
+        T.OfPoint(XYZ(mn.X, mx.Y, mx.Z)),
+        T.OfPoint(XYZ(mx.X, mn.Y, mn.Z)),
+        T.OfPoint(XYZ(mx.X, mn.Y, mx.Z)),
+        T.OfPoint(XYZ(mx.X, mx.Y, mn.Z)),
+        T.OfPoint(XYZ(mx.X, mx.Y, mx.Z)),
+    ]
+
+
+def get_stable_right_axis():
+    try:
+        v = uidoc.ActiveView.RightDirection
+        if v and v.GetLength() > 1e-9:
+            return v.Normalize()
+    except Exception:
+        pass
+    return XYZ(1, 0, 0)
+
+
 def collect_group_instances_in_scopebox(src_sb):
     """Collect both Model Groups and Detail Groups whose insertion point lies in SOURCE scope box"""
     out = []
@@ -542,6 +645,51 @@ def map_section_box(sec_bb, plane, move_vec):
 
     out = BoundingBoxXYZ()
     out.Transform = T1
+    out.Min = sec_bb.Min
+    out.Max = sec_bb.Max
+    return out
+
+
+def map_section_box_with_map_and_mirror(sec_bb, t_map, plane):
+    """
+    Map section box from SOURCE local to TARGET local (rigid),
+    then mirror about target plane.
+    """
+    T0 = sec_bb.Transform
+    T1 = t_map.Multiply(T0)
+    o1 = T1.Origin
+    bx1 = T1.BasisX
+    by1 = T1.BasisY
+
+    o2 = reflect_point_about_plane(o1, plane)
+    bx2 = reflect_vector_about_plane(bx1, plane)
+    by2 = reflect_vector_about_plane(by1, plane)
+
+    if bx2.GetLength() < 1e-9:
+        bx2 = XYZ(1, 0, 0)
+    if by2.GetLength() < 1e-9:
+        by2 = XYZ(0, 1, 0)
+    bx2 = bx2.Normalize()
+    by2 = by2.Normalize()
+
+    bz2 = bx2.CrossProduct(by2)
+    if bz2.GetLength() < 1e-9:
+        tmp = XYZ(0, 0, 1).CrossProduct(bx2)
+        if tmp.GetLength() < 1e-9:
+            tmp = XYZ(0, 1, 0)
+        by2 = tmp.Normalize()
+        bz2 = bx2.CrossProduct(by2)
+    bz2 = bz2.Normalize()
+    by2 = bz2.CrossProduct(bx2).Normalize()
+
+    T2 = Transform.Identity
+    T2.Origin = o2
+    T2.BasisX = bx2
+    T2.BasisY = by2
+    T2.BasisZ = bz2
+
+    out = BoundingBoxXYZ()
+    out.Transform = T2
     out.Min = sec_bb.Min
     out.Max = sec_bb.Max
     return out
@@ -721,29 +869,93 @@ def main():
         return
     do_copy = ask_copy()
 
-    # --- Scope boxes: SOURCE (what to mirror) + TARGET (where to mirror) ---
+    # --- Scope boxes: SOURCE (what to mirror) + optional TARGET (where to mirror) ---
     try:
         src_sb = pick_scopebox("Pick SOURCE scope box (elements to mirror)")
-        tgt_sb = pick_scopebox("Pick TARGET scope box (where to mirror)")
     except Exception:
         TaskDialog.Show("mirror_handler", "Scope box selection cancelled.")
         return
 
+    tgt_sb = None
     try:
-        plane = build_mapping_mirror_plane(src_sb, mode=mode)
-    except Exception as ex:
-        TaskDialog.Show("mirror_handler", "Failed to build mirror plane: {}".format(ex))
-        return
-
-    # Translate after mirror to align SOURCE -> TARGET centers
-    # This fixes "mirror copy ends up near source" when target is distant.
-    try:
-        cS = scopebox_center_world(src_sb)
-        cT = scopebox_center_world(tgt_sb)
-        cS_ref = reflect_point_about_plane(cS, plane)
-        move_vec = cT - cS_ref
+        tgt_sb = pick_scopebox("Pick TARGET scope box (Esc for in-place mirror)")
     except Exception:
-        move_vec = XYZ(0, 0, 0)
+        tgt_sb = None
+
+    has_target = tgt_sb is not None
+    forced_copy = False
+
+    if has_target and not do_copy:
+        # target picked implies copy workflow; in-place mirror does not map to target
+        forced_copy = True
+        do_copy = True
+
+    if has_target:
+        try:
+            bb_src = sb_bbox(src_sb)
+            bb_tgt = sb_bbox(tgt_sb)
+            if not bb_src or not bb_tgt:
+                raise Exception("Scope box has no bounding box/transform.")
+
+            plane = sb_world_face_plane(bb_tgt, mode if mode else "center")
+
+            # Build transforms using world-center origins + scopebox basis
+            src_center_world = sb_world_center(bb_src)
+            tgt_center_world = sb_world_center(bb_tgt)
+
+            T_src = Transform.Identity
+            T_src.Origin = src_center_world
+            T_src.BasisX = bb_src.Transform.BasisX
+            T_src.BasisY = bb_src.Transform.BasisY
+            T_src.BasisZ = bb_src.Transform.BasisZ
+
+            T_tgt = Transform.Identity
+            T_tgt.Origin = tgt_center_world
+            T_tgt.BasisX = bb_tgt.Transform.BasisX
+            T_tgt.BasisY = bb_tgt.Transform.BasisY
+            T_tgt.BasisZ = bb_tgt.Transform.BasisZ
+
+            # Rigid map from SOURCE local -> TARGET local
+            T_map = T_tgt.Multiply(T_src.Inverse)
+
+            # --- Debug prints (mandatory) ---
+            mapped_src_center = T_map.OfPoint(src_center_world)
+            dist = mapped_src_center.DistanceTo(tgt_center_world)
+
+            print("DEBUG: src_center_world = {}".format(src_center_world))
+            print("DEBUG: tgt_center_world = {}".format(tgt_center_world))
+            print("DEBUG: mapped_src_center = {}".format(mapped_src_center))
+            print("DEBUG: map->tgt center dist = {:.6f}".format(dist))
+            print("DEBUG: T_src.Origin = {}".format(T_src.Origin))
+            print("DEBUG: T_tgt.Origin = {}".format(T_tgt.Origin))
+            print("DEBUG: T_src.BasisX = {}".format(T_src.BasisX))
+            print("DEBUG: T_src.BasisY = {}".format(T_src.BasisY))
+            print("DEBUG: T_tgt.BasisX = {}".format(T_tgt.BasisX))
+            print("DEBUG: T_tgt.BasisY = {}".format(T_tgt.BasisY))
+
+            if dist > 1e-4:
+                TaskDialog.Show(
+                    "mirror_handler",
+                    "Preflight failed: mapped center too far from target center.\n"
+                    "Distance: {:.6f}".format(dist),
+                )
+                return
+
+        except Exception as ex:
+            TaskDialog.Show(
+                "mirror_handler", "Failed to build target mapping: {}".format(ex)
+            )
+            return
+    else:
+        # In-place mirror uses SOURCE scope box plane (legacy behavior)
+        try:
+            plane = mirror_plane_from_scopebox(src_sb, mode=mode)
+        except Exception as ex:
+            TaskDialog.Show(
+                "mirror_handler", "Failed to build mirror plane: {}".format(ex)
+            )
+            return
+        T_map = Transform.Identity
 
     ids = load_collected_ids()
     if not ids:
@@ -826,42 +1038,10 @@ def main():
         opts.SetClearAfterRollback(True)
         tx.SetFailureHandlingOptions(opts)
 
-    # --- Preflight (optional but ok) ---
-    # - checks if mirror will trigger non-ignorable failures
-    allowed_ids = []
-    preflight_errors = []
-    hard_skipped = []
-
-    for eid in ids_in_src:
-        tx = Transaction(doc, "mirror_handler: Preflight One")
-        started = False
-        try:
-            tx.Start()
-            started = True
-            set_failure_opts(tx, preflight_errors)
-
-            ElementTransformUtils.MirrorElements(
-                doc, ClrList[ElementId]([eid]), plane, do_copy
-            )
-            # If we reached here, no non-warning failure forced rollback yet.
-            # We still rollback becasue preflight must not persist
-            allowed_ids.append(eid)
-
-        except Exception as ex:
-            hard_skipped.append(eid)
-            preflight_errors.append(str(ex))
-        finally:
-            if started:
-                try:
-                    tx.RollBack()
-                except Exception:
-                    pass
-
-    # Roll back the entire preflight transaction so NOTHING is left behind
+    # Per-element execution (no preflight), required for robust fallback
+    allowed_ids = list(ids_in_src)
     if not allowed_ids:
-        TaskDialog.Show(
-            "mirror_handler", "All elements failed preflight; nothing to mirror."
-        )
+        TaskDialog.Show("mirror_handler", "No elements found inside SOURCE scope box.")
         return
 
     # ---------------------------------
@@ -875,125 +1055,148 @@ def main():
     created_ids = []
     run_errors = []
     failures = 0
+    per_cat_fail = defaultdict(int)
+    example_failures = []
+    cpo = CopyPasteOptions()
 
     try:
-        batch_ok = False
-        batch_created = []
         created_sections = []
 
         # -----------------------------------------
-        # Batch mirror (preferred)
+        # Per-element mirror with fallbacks
         # -----------------------------------------
-        txb = Transaction(doc, "mirror_handler: Mirror Batch")
-        try:
-            txb.Start()
-            set_failure_opts(txb, run_errors)
-
-            res_ids = ElementTransformUtils.MirrorElements(
-                doc, ClrList[ElementId](allowed_ids), plane, do_copy
-            )
-
-            st = txb.Commit()
-            batch_ok = st == TransactionStatus.Committed
-
-            if batch_ok and do_copy:
-                batch_created = list(res_ids)
-                # Move mirrored copies to TARGET if needed
-                if move_vec.GetLength() > 1e-6:
-                    try:
-                        txm = Transaction(doc, "mirror_handler: Move Batch Copy")
-                        txm.Start()
-                        set_failure_opts(txm, run_errors)
-                        ElementTransformUtils.MoveElements(
-                            doc, ClrList[ElementId](batch_created), move_vec
-                        )
-                        txm.Commit()
-                    except Exception as ex:
-                        run_errors.append("Batch move exception: {}".format(ex))
-
-        except Exception as ex:
-            run_errors.append("Batch exception: {}".format(ex))
+        for eid in allowed_ids:
+            tx = Transaction(doc, "mirror_handler: Mirror One")
+            started = False
             try:
-                txb.RollBack()
-            except Exception:
-                pass
-            batch_ok = False
+                tx.Start()
+                started = True
+                set_failure_opts(tx, run_errors)
 
-        # -----------------------------------------
-        # Fallback per-element if batch fails
-        # -----------------------------------------
-        if not batch_ok:
-            for eid in allowed_ids:
-                tx = Transaction(doc, "mirror_handler: Mirror One")
-                started = False
+                el = doc.GetElement(eid)
+                was_pinned = False
                 try:
-                    tx.Start()
-                    started = True
-                    set_failure_opts(tx, run_errors)
+                    if el and hasattr(el, "Pinned") and el.Pinned:
+                        was_pinned = True
+                        el.Pinned = False
+                except Exception:
+                    pass
 
-                    el = doc.GetElement(eid)
-                    was_pinned = False
+                created_this = []
+                mirror_ok = False
+
+                if has_target:
+                    # --- Target workflow: copy with translation, then mirror about TARGET face ---
                     try:
-                        if el and hasattr(el, "Pinned") and el.Pinned:
-                            was_pinned = True
-                            el.Pinned = False
-                    except Exception:
-                        pass
+                        res_ids = ElementTransformUtils.CopyElements(
+                            doc, ClrList[ElementId]([eid]), doc, T_map, cpo
+                        )
+                        created_this = list(res_ids)
+                        if created_this:
+                            ElementTransformUtils.MirrorElements(
+                                doc,
+                                ClrList[ElementId](created_this),
+                                plane,
+                                False,
+                            )
+                            mirror_ok = True
+                    except Exception as ex:
+                        mirror_ok = False
+                        run_errors.append(
+                            "Copy(map)+mirror failed ({}): {}".format(
+                                eid.IntegerValue, ex
+                            )
+                        )
 
-                    res_ids = ElementTransformUtils.MirrorElements(
-                        doc, ClrList[ElementId]([eid]), plane, do_copy
-                    )
-
-                    st = tx.Commit()
-                    if st == TransactionStatus.Committed:
-                        if do_copy:
-                            for rid in list(res_ids):
-                                re = doc.GetElement(rid)
-                                if re and re.IsValidObject:
-                                    created_ids.append(rid)
-                            # Move this mirrored copy to TARGET if needed
-                            if move_vec.GetLength() > 1e-6 and created_ids:
-                                try:
-                                    txm = Transaction(
-                                        doc, "mirror_handler: Move One Copy"
-                                    )
-                                    txm.Start()
-                                    set_failure_opts(txm, run_errors)
-                                    ElementTransformUtils.MoveElements(
+                    # --- Host-aware attempt: copy host + element, then mirror ---
+                    if (
+                        (not mirror_ok)
+                        and do_copy
+                        and (_cat_name(el) in HOST_AWARE_CATEGORIES)
+                    ):
+                        try:
+                            host = getattr(el, "Host", None)
+                            if (
+                                host
+                                and host.IsValidObject
+                                and _bbox_intersects_scopebox(host, src_sb)
+                            ):
+                                res_ids = ElementTransformUtils.CopyElements(
+                                    doc,
+                                    ClrList[ElementId]([host.Id, eid]),
+                                    doc,
+                                    T_map,
+                                    cpo,
+                                )
+                                created_this = list(res_ids)
+                                if created_this:
+                                    ElementTransformUtils.MirrorElements(
                                         doc,
-                                        ClrList[ElementId]([created_ids[-1]]),
-                                        move_vec,
+                                        ClrList[ElementId](created_this),
+                                        plane,
+                                        False,
                                     )
-                                    txm.Commit()
-                                except Exception as ex:
-                                    run_errors.append(
-                                        "Per-element move exception: {}".format(ex)
-                                    )
-
-                        if was_pinned:
-                            try:
-                                el2 = doc.GetElement(eid)
-                                if el2 and el2.IsValidObject:
-                                    el2.Pinned = True
-                            except Exception:
-                                pass
-                    else:
-                        failures += 1
-
-                except Exception as ex:
-                    failures += 1
-                    run_errors.append(
-                        "Per-element ({}): {}".format(eid.IntegerValue, ex)
-                    )
+                                    mirror_ok = True
+                        except Exception as ex:
+                            run_errors.append(
+                                "Host-aware copy+mirror failed ({}): {}".format(
+                                    eid.IntegerValue, ex
+                                )
+                            )
+                else:
+                    # --- In-place mirror (legacy behavior) ---
                     try:
-                        if started:
-                            tx.RollBack()
-                    except Exception:
-                        pass
+                        res_ids = ElementTransformUtils.MirrorElements(
+                            doc, ClrList[ElementId]([eid]), plane, do_copy
+                        )
+                        mirror_ok = True
+                        if do_copy:
+                            created_this = list(res_ids)
+                    except Exception as ex:
+                        mirror_ok = False
+                        run_errors.append(
+                            "Mirror failed ({}): {}".format(eid.IntegerValue, ex)
+                        )
 
-        else:
-            # batch succeeded
-            created_ids.extend(batch_created)
+                # No move_vec needed when using T_map
+
+                if not mirror_ok:
+                    raise Exception("All mirror/copy attempts failed.")
+
+                st = tx.Commit()
+                if st == TransactionStatus.Committed:
+                    if do_copy and mirror_ok:
+                        created_ids.extend(created_this)
+                    if was_pinned:
+                        try:
+                            el2 = doc.GetElement(eid)
+                            if el2 and el2.IsValidObject:
+                                el2.Pinned = True
+                        except Exception:
+                            pass
+                else:
+                    failures += 1
+                    per_cat_fail[_cat_name(el)] += 1
+
+            except Exception as ex:
+                failures += 1
+                el = doc.GetElement(eid)
+                per_cat_fail[_cat_name(el)] += 1
+                host_id, host_cat = _host_info(el)
+                famtype = _family_type_name(el)
+                reason = "Per-element ({}): {}".format(eid.IntegerValue, ex)
+                if host_id:
+                    reason += " | Host {} ({})".format(host_id, host_cat)
+                if famtype:
+                    reason += " | {}".format(famtype)
+                if len(example_failures) < 10:
+                    example_failures.append(reason)
+                run_errors.append(reason)
+                try:
+                    if started:
+                        tx.RollBack()
+                except Exception:
+                    pass
 
         # -----------------------------------------
         # Explicit Section Recreation (always run)
@@ -1035,7 +1238,12 @@ def main():
                         if not sec_bb:
                             continue
 
-                        new_bb = map_section_box(sec_bb, plane, move_vec)
+                        if has_target:
+                            new_bb = map_section_box_with_map_and_mirror(
+                                sec_bb, T_map, plane
+                            )
+                        else:
+                            new_bb = map_section_box(sec_bb, plane, XYZ(0, 0, 0))
 
                         vft = doc.GetElement(src_vs.GetTypeId())
                         if not vft:
@@ -1099,8 +1307,20 @@ def main():
         sections_created = 0
 
     note = ""
-    if (not do_copy) and move_vec.GetLength() > 1e-6:
-        note = "\nNote: In-place mirror does not apply target translation."
+    if forced_copy:
+        note = "\nNote: Target picked -> forced Copy mode for mapping+mirror."
+    elif not do_copy:
+        note = "\nNote: In-place mirror does not apply source->target mapping."
+
+    cat_lines = ""
+    if per_cat_fail:
+        cat_lines = "\nPer-category failures:\n- " + "\n- ".join(
+            ["{}: {}".format(k, v) for k, v in per_cat_fail.items()]
+        )
+
+    ex_lines = "None"
+    if example_failures:
+        ex_lines = "\n- " + "\n- ".join(example_failures[:10])
 
     msg = (
         "Mode: {0}\nCopy mode: {1}\n"
@@ -1108,7 +1328,7 @@ def main():
         "Failures (rolled back / exceptions): {3}\n"
         "Skipped groups: {4}\n"
         "Assemblies expanded: {5}\n"
-        "Hard skipped (preflight): {6}\n"
+        "Hard skipped: {6}\n"
         "Plane normal: ({7:.3f},{8:.3f},{9:.3f}){10}\n"
         "Run error samples: {11}\n"
         "Groups found (by location): {12}\n"
@@ -1117,6 +1337,8 @@ def main():
         "Sections found: {15}\n"
         "Sections created: {16}\n"
         "{17}"
+        "{18}"
+        "\nFailure examples:{19}\n"
     ).format(
         mode,
         "Create copy" if do_copy else "In-place",
@@ -1136,6 +1358,8 @@ def main():
         sections_found,
         sections_created,
         note,
+        cat_lines,
+        ex_lines,
     )
     TaskDialog.Show("mirror_handler", msg)
 
