@@ -35,6 +35,7 @@ from Autodesk.Revit.DB import (
     Line,
     LocationCurve,
     Outline,
+    SubTransaction,
     Transaction,
     TransactionGroup,
     View3D,
@@ -47,7 +48,7 @@ from Autodesk.Revit.UI.Selection import ObjectType, ISelectionFilter
 from Autodesk.Revit.Exceptions import OperationCanceledException
 from collections import defaultdict
 
-# from System.Collections.Generic import List as ClrList
+from System.Collections.Generic import List as ClrList
 
 import math
 import re
@@ -1667,6 +1668,9 @@ def main():
     # Stats
     total = len(candidates)
     changed = 0
+    attempted = 0
+    succeeded = 0
+    rolled_back_ids = []
     failed_tx = 0
     failed_no_delta = 0
     disconnect_retries = 0
@@ -1693,157 +1697,141 @@ def main():
             changed_this_pass = 0
             still_off_target = 0
 
-            for p, target, sysname in sorted(to_process, key=_sort_key):
-                diag = _pipe_diag(p)
-                method = "slope_param"
-                p0_before = p1_before = None
-                try:
-                    locb = p.Location
-                    crvb = locb.Curve
-                    p0_before = crvb.GetEndPoint(0)
-                    p1_before = crvb.GetEndPoint(1)
-                except Exception:
-                    pass
-                tx = Transaction(doc, "slope_solver: pipe {}".format(p.Id.IntegerValue))
-                tx.Start()
-                err_log = []
-                set_failure_opts(tx, err_log)
+            tx_pass = Transaction(doc, "slope_solver: pass {}".format(passes))
+            tx_pass_started = False
+            try:
+                tx_pass.Start()
+                tx_pass_started = True
 
-                try:
-                    ok, method = apply_slope_mep_safe(p, target)
-                    st = tx.Commit()
-                    tx_status = st.ToString()
-                    ex = None
-                except Exception as ex:
+                for p, target, sysname in sorted(to_process, key=_sort_key):
+                    attempted += 1
+                    diag = _pipe_diag(p)
+                    method = "slope_param"
+                    p0_before = p1_before = None
                     try:
-                        tx.RollBack()
+                        locb = p.Location
+                        crvb = locb.Curve
+                        p0_before = crvb.GetEndPoint(0)
+                        p1_before = crvb.GetEndPoint(1)
                     except Exception:
                         pass
-                    tx_status = "RolledBack"
 
-                actual = None
-                if tx_status == "Committed":
-                    actual = achieved_slope_ratio(p)
-                else:
-                    failed_tx += 1
-                    lvl_name, _ = _level_info(p)
-                    level_counts[lvl_name]["failed"] += 1
-                    if len(failure_samples) < 30:
-                        conn_ids = _end_connected_ids(p)
-                        failure_samples.append(
-                            "Pipe {id} ({name}) sys='{sys}' method={m} reason=TX_ROLLBACK tx={tx} ex={ex} failures={f} conn_ids={c} diag={d}".format(
-                                id=diag["id"],
-                                name=diag["name"],
-                                sys=diag["system"],
-                                m=method,
-                                tx=tx_status,
-                                ex=repr(ex),
-                                f="; ".join(err_log) if err_log else "None",
-                                c=conn_ids,
-                                d=diag,
-                            )
-                        )
-
-                if actual is not None and abs(actual - target) <= SLOPE_TOL:
-                    changed += 1
-                    changed_this_pass += 1
-                    lvl_name, _ = _level_info(p)
-                    level_counts[lvl_name]["changed"] += 1
-                    if debug_readback[sysname] < 3:
-                        try:
-                            loc = p.Location
-                            crv = loc.Curve
-                            p0 = crv.GetEndPoint(0)
-                            p1 = crv.GetEndPoint(1)
-                            hl = horiz_length(p0, p1)
-                            rise = abs(p1.Z - p0.Z)
-                            print(
-                                "DEBUG: sys='{}' pipe {} rise/run={:.6f}/{:.6f} ratio={:.6f}".format(
-                                    sysname,
-                                    p.Id.IntegerValue,
-                                    rise,
-                                    hl,
-                                    rise / hl if hl > 1e-9 else 0.0,
-                                )
-                            )
-                            debug_readback[sysname] += 1
-                        except Exception:
-                            pass
-                    continue
-
-                orig_ex = repr(ex) if ex else "None"
-                orig_fail = "; ".join(err_log) if err_log else "None"
-
-                tx2 = Transaction(
-                    doc, "slope_solver: disconnect_retry {}".format(p.Id.IntegerValue)
-                )
-                tx2.Start()
-                err_log2 = []
-                set_failure_opts(tx2, err_log2)
-                try:
-                    ok2, method2, reconnect_note, disc_ok, rec_ok = (
-                        _try_disconnect_apply_reconnect(p, target)
-                    )
-                    st2 = tx2.Commit()
-                    tx2_status = st2.ToString()
-                except Exception as ex2:
+                    subtx = SubTransaction(doc)
+                    subtx_started = False
+                    err_log = []
                     try:
-                        tx2.RollBack()
-                    except Exception:
-                        pass
-                    failed_tx += 1
-                    if len(failure_samples) < 30:
-                        failure_samples.append(
-                            "Pipe {id} ({name}) sys='{sys}' method=disconnect_retry tx=RolledBack ex={ex} failures={f} diag={d}".format(
-                                id=diag["id"],
-                                name=diag["name"],
-                                sys=diag["system"],
-                                ex=repr(ex2),
-                                f="; ".join(err_log2) if err_log2 else "None",
-                                d=diag,
-                            )
-                        )
-                    continue
+                        subtx.Start()
+                        subtx_started = True
+                        ok, method = apply_slope_mep_safe(p, target)
+                        st = subtx.Commit()
+                        tx_status = st.ToString()
+                        ex = None
+                    except Exception as ex:
+                        if subtx_started:
+                            try:
+                                subtx.RollBack()
+                            except Exception:
+                                pass
+                        tx_status = "RolledBack"
 
-                disconnect_retries += 1
-                if tx2_status != "Committed":
-                    failed_tx += 1
-                    lvl_name, _ = _level_info(p)
-                    level_counts[lvl_name]["failed"] += 1
-                    if len(failure_samples) < 30:
-                        conn_ids = _end_connected_ids(p)
-                        failure_samples.append(
-                            "Pipe {id} ({name}) sys='{sys}' method=disconnect_retry reason=TX_ROLLBACK tx={tx} ex={ex} failures={f} orig_failures={of} disconnect_ok={do} reconnect_ok={ro} conn_ids={c} diag={d}".format(
-                                id=diag["id"],
-                                name=diag["name"],
-                                sys=diag["system"],
-                                tx=tx2_status,
-                                ex=repr(None),
-                                f="; ".join(err_log2) if err_log2 else "None",
-                                of=orig_fail,
-                                do=disc_ok,
-                                ro=rec_ok,
-                                c=conn_ids,
-                                d=diag,
-                            )
-                        )
-                    continue
-
-                actual2 = achieved_slope_ratio(p)
-                if actual2 is not None and abs(actual2 - target) <= SLOPE_TOL:
-                    changed += 1
-                    changed_this_pass += 1
-                    lvl_name, _ = _level_info(p)
-                    level_counts[lvl_name]["changed"] += 1
-                    if reconnect_note == "reconnect_failed":
-                        reconnect_failures += 1
+                    actual = None
+                    if tx_status == "Committed":
+                        actual = achieved_slope_ratio(p)
+                    else:
+                        rolled_back_ids.append(p.Id.IntegerValue)
+                        failed_tx += 1
+                        lvl_name, _ = _level_info(p)
+                        level_counts[lvl_name]["failed"] += 1
                         if len(failure_samples) < 30:
                             conn_ids = _end_connected_ids(p)
                             failure_samples.append(
-                                "Pipe {id} ({name}) sys='{sys}' method=disconnect_retry reason=NETWORK_RECONNECT_FAILED tx=Committed ex=None failures={f} orig_failures={of} disconnect_ok={do} reconnect_ok={ro} conn_ids={c} diag={d}".format(
+                                "Pipe {id} ({name}) sys='{sys}' method={m} reason=TX_ROLLBACK tx={tx} ex={ex} failures={f} conn_ids={c} diag={d}".format(
                                     id=diag["id"],
                                     name=diag["name"],
                                     sys=diag["system"],
+                                    m=method,
+                                    tx=tx_status,
+                                    ex=repr(ex),
+                                    f="; ".join(err_log) if err_log else "None",
+                                    c=conn_ids,
+                                    d=diag,
+                                )
+                            )
+                    if actual is not None and abs(actual - target) <= SLOPE_TOL:
+                        changed += 1
+                        succeeded += 1
+                        changed_this_pass += 1
+                        lvl_name, _ = _level_info(p)
+                        level_counts[lvl_name]["changed"] += 1
+                        if debug_readback[sysname] < 3:
+                            try:
+                                loc = p.Location
+                                crv = loc.Curve
+                                p0 = crv.GetEndPoint(0)
+                                p1 = crv.GetEndPoint(1)
+                                hl = horiz_length(p0, p1)
+                                rise = abs(p1.Z - p0.Z)
+                                print(
+                                    "DEBUG: sys='{}' pipe {} rise/run={:.6f}/{:.6f} ratio={:.6f}".format(
+                                        sysname,
+                                        p.Id.IntegerValue,
+                                        rise,
+                                        hl,
+                                        rise / hl if hl > 1e-9 else 0.0,
+                                    )
+                                )
+                                debug_readback[sysname] += 1
+                            except Exception:
+                                pass
+                        continue
+                    orig_ex = repr(ex) if ex else "None"
+                    orig_fail = "; ".join(err_log) if err_log else "None"
+
+                    subtx2 = SubTransaction(doc)
+                    subtx2_started = False
+                    err_log2 = []
+                    try:
+                        subtx2.Start()
+                        subtx2_started = True
+                        ok2, method2, reconnect_note, disc_ok, rec_ok = (
+                            _try_disconnect_apply_reconnect(p, target)
+                        )
+                        st2 = subtx2.Commit()
+                        tx2_status = st2.ToString()
+                    except Exception as ex2:
+                        if subtx2_started:
+                            try:
+                                subtx2.RollBack()
+                            except Exception:
+                                pass
+                        failed_tx += 1
+                        if len(failure_samples) < 30:
+                            failure_samples.append(
+                                "Pipe {id} ({name}) sys='{sys}' method=disconnect_retry tx=RolledBack ex={ex} failures={f} diag={d}".format(
+                                    id=diag["id"],
+                                    name=diag["name"],
+                                    sys=diag["system"],
+                                    ex=repr(ex2),
+                                    f="; ".join(err_log2) if err_log2 else "None",
+                                    d=diag,
+                                )
+                            )
+                        continue
+
+                    disconnect_retries += 1
+                    if tx2_status != "Committed":
+                        failed_tx += 1
+                        lvl_name, _ = _level_info(p)
+                        level_counts[lvl_name]["failed"] += 1
+                        if len(failure_samples) < 30:
+                            conn_ids = _end_connected_ids(p)
+                            failure_samples.append(
+                                "Pipe {id} ({name}) sys='{sys}' method=disconnect_retry reason=TX_ROLLBACK tx={tx} ex={ex} failures={f} orig_failures={of} disconnect_ok={do} reconnect_ok={ro} conn_ids={c} diag={d}".format(
+                                    id=diag["id"],
+                                    name=diag["name"],
+                                    sys=diag["system"],
+                                    tx=tx2_status,
+                                    ex=repr(None),
                                     f="; ".join(err_log2) if err_log2 else "None",
                                     of=orig_fail,
                                     do=disc_ok,
@@ -1852,193 +1840,261 @@ def main():
                                     d=diag,
                                 )
                             )
-                    continue
+                        continue
+                    actual2 = achieved_slope_ratio(p)
+                    if actual2 is not None and abs(actual2 - target) <= SLOPE_TOL:
+                        changed += 1
+                        succeeded += 1
+                        changed_this_pass += 1
+                        lvl_name, _ = _level_info(p)
+                        level_counts[lvl_name]["changed"] += 1
+                        if reconnect_note == "reconnect_failed":
+                            reconnect_failures += 1
+                            if len(failure_samples) < 30:
+                                conn_ids = _end_connected_ids(p)
+                                failure_samples.append(
+                                    "Pipe {id} ({name}) sys='{sys}' method=disconnect_retry reason=NETWORK_RECONNECT_FAILED tx=Committed ex=None failures={f} orig_failures={of} disconnect_ok={do} reconnect_ok={ro} conn_ids={c} diag={d}".format(
+                                        id=diag["id"],
+                                        name=diag["name"],
+                                        sys=diag["system"],
+                                        f="; ".join(err_log2) if err_log2 else "None",
+                                        of=orig_fail,
+                                        do=disc_ok,
+                                        ro=rec_ok,
+                                        c=conn_ids,
+                                        d=diag,
+                                    )
+                                )
+                        continue
 
-                failed_no_delta += 1
-                still_off_target += 1
-                lvl_name, _ = _level_info(p)
-                level_counts[lvl_name]["failed"] += 1
-                if len(failure_samples) < 30:
-                    reason = (
-                        "SLOPE_READONLY"
-                        if _slope_readonly(diag)
-                        else "CONSTRAINT_SOLVED_BACK"
-                    )
-                    conn_ids = _end_connected_ids(p)
-                    p0_after = p1_after = None
+                    failed_no_delta += 1
+                    still_off_target += 1
+                    lvl_name, _ = _level_info(p)
+                    level_counts[lvl_name]["failed"] += 1
+                    if len(failure_samples) < 30:
+                        reason = (
+                            "SLOPE_READONLY"
+                            if _slope_readonly(diag)
+                            else "CONSTRAINT_SOLVED_BACK"
+                        )
+                        conn_ids = _end_connected_ids(p)
+                        p0_after = p1_after = None
+                        try:
+                            loca = p.Location
+                            crva = loca.Curve
+                            p0_after = crva.GetEndPoint(0)
+                            p1_after = crva.GetEndPoint(1)
+                        except Exception:
+                            pass
+                        failure_samples.append(
+                            "Pipe {id} ({name}) sys='{sys}' method=disconnect_retry reason={r} target={t:.6f} actual={a} p0_before={p0b} p1_before={p1b} p0_after={p0a} p1_after={p1a} tx=Committed ex=None failures={f} orig_failures={of} disconnect_ok={do} reconnect_ok={ro} conn_ids={c} diag={d}".format(
+                                id=diag["id"],
+                                name=diag["name"],
+                                sys=diag["system"],
+                                f="; ".join(err_log2) if err_log2 else "None",
+                                of=orig_fail,
+                                r=reason,
+                                t=target,
+                                a=actual2,
+                                p0b=p0_before,
+                                p1b=p1_before,
+                                p0a=p0_after,
+                                p1a=p1_after,
+                                do=disc_ok,
+                                ro=rec_ok,
+                                c=conn_ids,
+                                d=diag,
+                            )
+                        )
+                        if (
+                            target == SLOPE_VWA
+                            and actual2 is not None
+                            and abs(actual2 - SLOPE_HWA) <= SLOPE_TOL
+                        ):
+                            vwa_wrong_slope_ids.append(p.Id.IntegerValue)
+                            if len(vwa_wrong_details) < 20:
+                                vwa_wrong_details.append(
+                                    "Pipe {} target={:.6f} final={} method={} rule={} sysstr='{}'".format(
+                                        p.Id.IntegerValue,
+                                        target,
+                                        actual2,
+                                        method,
+                                        classify_target_slope_details(p)[2],
+                                        diag.get("system"),
+                                    )
+                                )
+
+                if changed_this_pass == 0:
                     try:
-                        loca = p.Location
-                        crva = loca.Curve
-                        p0_after = crva.GetEndPoint(0)
-                        p1_after = crva.GetEndPoint(1)
+                        tx_pass.Commit()
+                    except Exception:
+                        try:
+                            tx_pass.RollBack()
+                        except Exception:
+                            pass
+                    break
+
+                try:
+                    tx_pass.Commit()
+                except Exception:
+                    try:
+                        tx_pass.RollBack()
                     except Exception:
                         pass
-                    failure_samples.append(
-                        "Pipe {id} ({name}) sys='{sys}' method=disconnect_retry reason={r} target={t:.6f} actual={a} p0_before={p0b} p1_before={p1b} p0_after={p0a} p1_after={p1a} tx=Committed ex=None failures={f} orig_failures={of} disconnect_ok={do} reconnect_ok={ro} conn_ids={c} diag={d}".format(
-                            id=diag["id"],
-                            name=diag["name"],
-                            sys=diag["system"],
-                            f="; ".join(err_log2) if err_log2 else "None",
-                            of=orig_fail,
-                            r=reason,
-                            t=target,
-                            a=actual2,
-                            p0b=p0_before,
-                            p1b=p1_before,
-                            p0a=p0_after,
-                            p1a=p1_after,
-                            do=disc_ok,
-                            ro=rec_ok,
-                            c=conn_ids,
-                            d=diag,
-                        )
-                    )
-                    if (
-                        target == SLOPE_VWA
-                        and actual2 is not None
-                        and abs(actual2 - SLOPE_HWA) <= SLOPE_TOL
+
+            finally:
+                if tx_pass_started:
+                    try:
+                        if tx_pass.HasStarted():
+                            tx_pass.RollBack()
+                    except Exception:
+                        pass
+
+        if failure_samples:
+            print("DEBUG: failure samples:")
+            for s in failure_samples[:30]:
+                print("  - {}".format(s))
+
+        # Level summary lines
+        lvl_lines = []
+        for lvl, stats in level_counts.items():
+            lvl_lines.append(
+                "{}: c={} ch={} f={} sk={}".format(
+                    lvl,
+                    stats["candidates"],
+                    stats["changed"],
+                    stats["failed"],
+                    stats["skipped"],
+                )
+            )
+
+        expected_skips = skipped_pinned + skipped_too_short + skipped_near_vertical
+        actual_failures = failed_tx + reconnect_failures + failed_no_delta
+        status_line = "OK" if actual_failures == 0 else "ATTENTION"
+
+        msg = (
+            "Status: {0}\n"
+            "Candidates: {1}\n"
+            "Attempted: {2}\n"
+            "Succeeded: {3}\n"
+            "Changed (validated): {4}\n"
+            "Not modified (expected): {5}\n"
+            "Actual failures: {6}\n"
+            "Failed (tx rollback): {7}\n"
+            "Failed (no slope delta): {8}\n"
+            "Skipped (pinned): {9}\n"
+            "Skipped (no location): {10}\n"
+            "Skipped (too short): {11}\n"
+            "Skipped (no rule): {12}\n"
+            "Skipped (near vertical): {13}\n"
+            "Disconnect retries: {14}\n"
+            "Reconnect failures: {15}\n"
+            "Passes executed: {16}\n"
+            "Still off-target (>tol): {17}\n"
+            "Rolled-back count: {18}\n"
+            "Rolled-back ids (first 20): {19}\n\n"
+            "Level summary:\n- {20}\n\n"
+            "Slope VWA: {21:.6f} ({22:.1f}/1000)\n"
+            "Slope HWA: {23:.6f} ({24:.1f}/1000)\n\n"
+            "Skipped / Not modified samples (reasons):\n- {25}\n\n"
+            "VWA wrong slope: {26}\n"
+            "VWA wrong ids (first 20): {27}\n"
+            "VWA wrong details (first 20):\n- {28}"
+        ).format(
+            status_line,
+            total,
+            attempted,
+            succeeded,
+            changed,
+            expected_skips,
+            actual_failures,
+            failed_tx,
+            failed_no_delta,
+            skipped_pinned,
+            skipped_no_location,
+            skipped_too_short,
+            skipped_no_rule,
+            skipped_near_vertical,
+            disconnect_retries,
+            reconnect_failures,
+            passes,
+            still_off_target,
+            len(rolled_back_ids),
+            rolled_back_ids[:20],
+            "\n- ".join(lvl_lines) if lvl_lines else "None",
+            SLOPE_VWA,
+            SLOPE_VWA * 1000.0,
+            SLOPE_HWA,
+            SLOPE_HWA * 1000.0,
+            "\n- ".join(failure_samples[:30]) if failure_samples else "None",
+            len(vwa_wrong_slope_ids),
+            vwa_wrong_slope_ids[:20],
+            "\n- ".join(vwa_wrong_details[:20]) if vwa_wrong_details else "None",
+        )
+
+        try:
+            TaskDialog.Show("slope_solver", msg)
+        except Exception:
+            pass
+
+        # Optional isolate skipped pipes in temp 3D view
+        try:
+            if skipped_ids:
+                td2 = TaskDialog("slope_solver")
+                td2.MainInstruction = "Isolate skipped pipes in a temporary 3D view?"
+                td2.CommonButtons = (
+                    TaskDialogCommonButtons.Yes | TaskDialogCommonButtons.No
+                )
+                res2 = td2.Show()
+                if res2 == TaskDialogResult.Yes:
+                    txv = Transaction(doc, "slope_solver: isolate skipped")
+                    txv.Start()
+                    vft = None
+                    for vt in (
+                        FilteredElementCollector(doc)
+                        .OfClass(ViewFamilyType)
+                        .ToElements()
                     ):
-                        vwa_wrong_slope_ids.append(p.Id.IntegerValue)
-                        if len(vwa_wrong_details) < 20:
-                            vwa_wrong_details.append(
-                                "Pipe {} target={:.6f} final={} method={} rule={} sysstr='{}'".format(
-                                    p.Id.IntegerValue,
-                                    target,
-                                    actual2,
-                                    method,
-                                    classify_target_slope_details(p)[2],
-                                    diag.get("system"),
-                                )
+                        try:
+                            if vt.ViewFamily == ViewFamily.ThreeDimensional:
+                                vft = vt
+                                break
+                        except Exception:
+                            pass
+                    if vft:
+                        v3d = View3D.CreateIsometric(doc, vft.Id)
+                        if v3d:
+                            v3d.Name = _unique_view_name("slope_solver_skipped_temp")
+                            v3d.IsolateElementsTemporary(
+                                ClrList[ElementId](skipped_ids)
                             )
+                            try:
+                                uidoc.ActiveView = v3d
+                            except Exception:
+                                pass
+                    txv.Commit()
+        except Exception as ex:
+            print("DEBUG: isolate view failed: {}".format(repr(ex)))
+            print("DEBUG: intended view name = slope_solver_skipped_temp")
+            try:
+                txv.RollBack()
+            except Exception:
+                pass
 
-            if changed_this_pass == 0:
-                break
+        try:
+            tg.Assimilate()
+        except Exception:
+            try:
+                tg.RollBack()
+            except Exception:
+                pass
 
-        tg.Assimilate()
-
-    except Exception:
+    except Exception as ex:
         try:
             tg.RollBack()
         except Exception:
             pass
         raise
-
-    if failure_samples:
-        print("DEBUG: failure samples:")
-        for s in failure_samples[:30]:
-            print("  - {}".format(s))
-
-    # Level summary lines
-    lvl_lines = []
-    for lvl, stats in level_counts.items():
-        lvl_lines.append(
-            "{}: c={} ch={} f={} sk={}".format(
-                lvl,
-                stats["candidates"],
-                stats["changed"],
-                stats["failed"],
-                stats["skipped"],
-            )
-        )
-
-    expected_skips = skipped_pinned + skipped_too_short + skipped_near_vertical
-    actual_failures = failed_tx + reconnect_failures + failed_no_delta
-    status_line = "OK" if actual_failures == 0 else "ATTENTION"
-
-    msg = (
-        "Status: {0}\n"
-        "Candidates: {1}\n"
-        "Changed (validated): {2}\n"
-        "Not modified (expected): {3}\n"
-        "Actual failures: {4}\n"
-        "Failed (tx rollback): {5}\n"
-        "Failed (no slope delta): {6}\n"
-        "Skipped (pinned): {7}\n"
-        "Skipped (no location): {8}\n"
-        "Skipped (too short): {9}\n"
-        "Skipped (no rule): {10}\n"
-        "Skipped (near vertical): {11}\n"
-        "Disconnect retries: {12}\n"
-        "Reconnect failures: {13}\n"
-        "Passes executed: {14}\n"
-        "Still off-target (>tol): {15}\n\n"
-        "Level summary:\n- {16}\n\n"
-        "Slope VWA: {17:.6f} ({18:.1f}/1000)\n"
-        "Slope HWA: {19:.6f} ({20:.1f}/1000)\n\n"
-        "Skipped / Not modified samples (reasons):\n- {21}\n\n"
-        "VWA wrong slope: {22}\n"
-        "VWA wrong ids (first 20): {23}\n"
-        "VWA wrong details (first 20):\n- {24}"
-    ).format(
-        status_line,
-        total,
-        changed,
-        expected_skips,
-        actual_failures,
-        failed_tx,
-        failed_no_delta,
-        skipped_pinned,
-        skipped_no_location,
-        skipped_too_short,
-        skipped_no_rule,
-        skipped_near_vertical,
-        disconnect_retries,
-        reconnect_failures,
-        passes,
-        still_off_target,
-        "\n- ".join(lvl_lines) if lvl_lines else "None",
-        SLOPE_VWA,
-        SLOPE_VWA * 1000.0,
-        SLOPE_HWA,
-        SLOPE_HWA * 1000.0,
-        "\n- ".join(failure_samples[:30]) if failure_samples else "None",
-        len(vwa_wrong_slope_ids),
-        vwa_wrong_slope_ids[:20],
-        "\n- ".join(vwa_wrong_details[:20]) if vwa_wrong_details else "None",
-    )
-
-    try:
-        TaskDialog.Show("slope_solver", msg)
-    except Exception:
-        pass
-
-    # Optional isolate skipped pipes in temp 3D view
-    try:
-        if skipped_ids:
-            td2 = TaskDialog("slope_solver")
-            td2.MainInstruction = "Isolate skipped pipes in a temporary 3D view?"
-            td2.CommonButtons = TaskDialogCommonButtons.Yes | TaskDialogCommonButtons.No
-            res2 = td2.Show()
-            if res2 == TaskDialogResult.Yes:
-                txv = Transaction(doc, "slope_solver: isolate skipped")
-                txv.Start()
-                vft = None
-                for vt in (
-                    FilteredElementCollector(doc).OfClass(ViewFamilyType).ToElements()
-                ):
-                    try:
-                        if vt.ViewFamily == ViewFamily.ThreeDimensional:
-                            vft = vt
-                            break
-                    except Exception:
-                        pass
-                if vft:
-                    v3d = View3D.CreateIsometric(doc, vft.Id)
-                    if v3d:
-                        v3d.Name = _unique_view_name("slope_solver_skipped_temp")
-                        v3d.IsolateElementsTemporary(skipped_ids)
-                        try:
-                            uidoc.ActiveView = v3d
-                        except Exception:
-                            pass
-                txv.Commit()
-    except Exception as ex:
-        print("DEBUG: isolate view failed: {}".format(repr(ex)))
-        print("DEBUG: intended view name = slope_solver_skipped_temp")
-        try:
-            txv.RollBack()
-        except Exception:
-            pass
 
 
 if __name__ == "__main__":
