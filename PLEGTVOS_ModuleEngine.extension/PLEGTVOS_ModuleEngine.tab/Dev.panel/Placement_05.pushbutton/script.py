@@ -246,6 +246,13 @@ def pick_scopebox(prompt):
     return doc.GetElement(ref.ElementId)
 
 
+def pick_scopeboxes(prompt):
+    refs = uidoc.Selection.PickObjects(
+        ObjectType.Element, ScopeBoxSelectionFilter(), prompt
+    )
+    return [doc.GetElement(r.ElementId) for r in refs if r]
+
+
 def pick_elements():
     ids = list(uidoc.Selection.GetElementIds())
     if ids:
@@ -308,43 +315,16 @@ class DupTypeHandler(IDuplicateTypeNamesHandler):
         return DuplicateTypeAction.UseDestinationTypes
 
 
-def main():
-    try:
-        src_sb = pick_scopebox("Pick SOURCE scope box")
-        tgt_sb = pick_scopebox("Pick TARGET scope box")
-    except Exception:
-        TaskDialog.Show("transform_engine", "Scope box selection cancelled.")
-        return
-
-    try:
-        src_frame = build_frame_from_scopebox(src_sb)
-        tgt_frame = build_frame_from_scopebox(tgt_sb)
-    except Exception as ex:
-        TaskDialog.Show("transform_engine", "Frame build failed: {}".format(ex))
-        return
-
-    log_frame("Source", src_frame)
-    log_frame("Target", tgt_frame)
-    xf = compute_transform(src_frame, tgt_frame)
-    summarize_transform(xf)
-
-    elems = pick_elements()
-    elem_ids = [e.Id for e in elems if e and e.IsValidObject]
-    if not elem_ids:
-        TaskDialog.Show(
-            "transform_engine",
-            "No elements provided (selection empty and no saved state found).",
-        )
-        return
-
+def copy_to_target(xf, elems):
     opt = CopyPasteOptions()
     opt.SetDuplicateTypeNamesHandler(DupTypeHandler())
+    elem_ids = [e.Id for e in elems if e and e.IsValidObject]
     idlist = ClrList[ElementId]()
     vs_ids = ClrList[ElementId]()
     view_ids = ClrList[ElementId]()
     assembly_ids = set()
     skipped_bad = 0
-    skipped_details = []  # list of (id, reason, category)
+    skipped_details = []
 
     def is_view_elem(e):
         return isinstance(e, View)
@@ -370,7 +350,6 @@ def main():
                 continue
         except Exception:
             pass
-        # capture assemblies: if member, collect parent assembly instead
         try:
             asm_id = getattr(e, "AssemblyInstanceId", ElementId.InvalidElementId)
             if asm_id and asm_id != ElementId.InvalidElementId:
@@ -382,14 +361,12 @@ def main():
             skipped_bad += 1
             skipped_details.append((i.IntegerValue, "no category", "<None>"))
             continue
-        # skip systems explicitly (non-physical)
         cname = cat_name(e)
         if cname in ("Piping Systems", "Duct Systems"):
             skipped_details.append((i.IntegerValue, "system skipped", cname))
             continue
         idlist.Add(i)
 
-    # add assembly instances (unique)
     for aid in assembly_ids:
         idlist.Add(aid)
 
@@ -400,207 +377,133 @@ def main():
     views_failed = 0
     copy_failed_ids = ClrList[ElementId]()
     fail_by_cat = {}
-    system_cats = {"Piping Systems", "Duct Systems"}
-    mapping_pairs = []  # (source_id, new_id)
+    mapping_pairs = []
 
-    t = Transaction(doc, "Transform Engine Copy")
-    try:
-        t.Start()
-        if idlist.Count > 0:
-            try:
-                new_ids = ElementTransformUtils.CopyElements(doc, idlist, doc, xf, opt)
-                new_list = list(new_ids)
-                copied = len(new_list)
-                if len(new_list) == idlist.Count:
-                    for idx, sid in enumerate(idlist):
-                        mapping_pairs.append((sid, new_list[idx]))
-            except Exception:
-                # fallback: copy one by one
-                copied = 0
-                for eid in idlist:
-                    try:
-                        solo = ClrList[ElementId]()
-                        solo.Add(eid)
-                        res = ElementTransformUtils.CopyElements(
-                            doc, solo, doc, xf, opt
-                        )
-                        res_list = list(res)
-                        copied += len(res_list)
-                        if len(res_list) == 1:
-                            mapping_pairs.append((eid, res_list[0]))
-                    except Exception:
-                        skipped_bad += 1
-                        copy_failed_ids.Add(eid)
-                        try:
-                            e = doc.GetElement(eid)
-                            cname = cat_name(e)
-                            fail_by_cat.setdefault(cname, []).append(eid)
-                            skipped_details.append(
-                                (eid.IntegerValue, "copy fail", cname)
-                            )
-                        except Exception:
-                            pass
-        # attempt view-specific move only if rotation is ~0 (translation only)
-        angle = math.atan2(xf.BasisX.Y, xf.BasisX.X)
-        if vs_ids.Count > 0 and abs(angle) < 1e-6:
-            try:
-                translation = xf.Origin
-                vs_new = ElementTransformUtils.CopyElements(
-                    uidoc.ActiveView, vs_ids, translation
-                )
-                vs_copied = len(list(vs_new))
-            except Exception:
-                vs_failed = vs_ids.Count
-        elif vs_ids.Count > 0:
-            vs_failed = vs_ids.Count
-        # retry specific categories with pure translation if rotation ~0
-        if abs(angle) < 1e-6 and fail_by_cat:
-            retry_cats = ["Center line", "Center Line"]
-            for catlabel in retry_cats:
-                ids_for_cat = fail_by_cat.get(catlabel, [])
-                if not ids_for_cat:
-                    continue
+    if idlist.Count > 0:
+        try:
+            new_ids = ElementTransformUtils.CopyElements(doc, idlist, doc, xf, opt)
+            new_list = list(new_ids)
+            copied = len(new_list)
+            if len(new_list) == idlist.Count:
+                for idx, sid in enumerate(idlist):
+                    mapping_pairs.append((sid, new_list[idx]))
+        except Exception:
+            copied = 0
+            for eid in idlist:
                 try:
-                    rl = ClrList[ElementId]()
+                    solo = ClrList[ElementId]()
+                    solo.Add(eid)
+                    res = ElementTransformUtils.CopyElements(doc, solo, doc, xf, opt)
+                    res_list = list(res)
+                    copied += len(res_list)
+                    if len(res_list) == 1:
+                        mapping_pairs.append((eid, res_list[0]))
+                except Exception:
+                    skipped_bad += 1
+                    copy_failed_ids.Add(eid)
+                    try:
+                        e = doc.GetElement(eid)
+                        cname = cat_name(e)
+                        fail_by_cat.setdefault(cname, []).append(eid)
+                        skipped_details.append((eid.IntegerValue, "copy fail", cname))
+                    except Exception:
+                        pass
+
+    angle = math.atan2(xf.BasisX.Y, xf.BasisX.X)
+    if vs_ids.Count > 0 and abs(angle) < 1e-6:
+        try:
+            translation = xf.Origin
+            vs_new = ElementTransformUtils.CopyElements(uidoc.ActiveView, vs_ids, translation)
+            vs_copied = len(list(vs_new))
+        except Exception:
+            vs_failed = vs_ids.Count
+    elif vs_ids.Count > 0:
+        vs_failed = vs_ids.Count
+
+    if abs(angle) < 1e-6 and fail_by_cat:
+        retry_cats = ["Center line", "Center Line"]
+        for catlabel in retry_cats:
+            ids_for_cat = fail_by_cat.get(catlabel, [])
+            if not ids_for_cat:
+                continue
+            try:
+                rl = ClrList[ElementId]()
+                for rid in ids_for_cat:
+                    rl.Add(rid)
+                trans_res = ElementTransformUtils.CopyElements(
+                    uidoc.ActiveView, rl, xf.Origin
+                )
+                count_new = len(list(trans_res))
+                if count_new:
+                    copied += count_new
                     for rid in ids_for_cat:
-                        rl.Add(rid)
-                    trans_res = ElementTransformUtils.CopyElements(
-                        uidoc.ActiveView, rl, xf.Origin
+                        if rid in copy_failed_ids:
+                            copy_failed_ids.Remove(rid)
+                    skipped_details = [
+                        sd
+                        for sd in skipped_details
+                        if not (sd[1] == "copy fail" and sd[2] == catlabel)
+                    ]
+            except Exception:
+                continue
+
+    if copy_failed_ids.Count > 0 and abs(angle) < 1e-6:
+        try:
+            retry = ElementTransformUtils.CopyElements(
+                uidoc.ActiveView, copy_failed_ids, xf.Origin
+            )
+            copied += len(list(retry))
+            copy_failed_ids = ClrList[ElementId]()
+        except Exception:
+            pass
+
+    if view_ids.Count > 0:
+        try:
+            v_new = ElementTransformUtils.CopyElements(doc, view_ids, doc, xf, opt)
+            views_copied = len(list(v_new))
+        except Exception:
+            views_failed = view_ids.Count
+
+    if fail_by_cat.get("Center line") or fail_by_cat.get("Center Line"):
+        from Autodesk.Revit.DB import SketchPlane, Plane
+
+        for catlabel in ("Center line", "Center Line"):
+            ids_for_cat = fail_by_cat.get(catlabel, [])
+            for rid in ids_for_cat:
+                try:
+                    e = doc.GetElement(rid)
+                    loc = getattr(e, "Location", None)
+                    if not loc or not hasattr(loc, "Curve"):
+                        continue
+                    curve = loc.Curve
+                    new_curve = curve.CreateTransformed(xf)
+                    try:
+                        direction = new_curve.ComputeDerivatives(0.5, True).BasisX
+                    except Exception:
+                        direction = None
+                    if direction is None:
+                        continue
+                    normal = direction.CrossProduct(XYZ.BasisZ)
+                    if normal.GetLength() < 1e-6:
+                        normal = direction.CrossProduct(XYZ.BasisX)
+                    if normal.GetLength() < 1e-6:
+                        normal = XYZ.BasisZ
+                    normal = normal.Normalize()
+                    plane = Plane.CreateByNormalAndOrigin(
+                        normal, new_curve.GetEndPoint(0)
                     )
-                    count_new = len(list(trans_res))
-                    if count_new:
-                        copied += count_new
-                        # clear these failures from bookkeeping
-                        for rid in ids_for_cat:
-                            if rid in copy_failed_ids:
-                                copy_failed_ids.Remove(rid)
-                        # remove from skipped_details
-                        skipped_details = [
-                            sd
-                            for sd in skipped_details
-                            if not (sd[1] == "copy fail" and sd[2] == catlabel)
-                        ]
+                    sp = SketchPlane.Create(doc, plane)
+                    mc = doc.Create.NewModelCurve(new_curve, sp)
+                    copied += 1
+                    mapping_pairs.append((rid, mc.Id))
+                    skipped_details = [
+                        sd
+                        for sd in skipped_details
+                        if not (sd[1] == "copy fail" and sd[2] == catlabel)
+                    ]
                 except Exception:
                     continue
-        # retry any failed model ids via pure translation in active view if rotation ~ 0
-        if copy_failed_ids.Count > 0 and abs(angle) < 1e-6:
-            try:
-                retry = ElementTransformUtils.CopyElements(
-                    uidoc.ActiveView, copy_failed_ids, xf.Origin
-                )
-                copied += len(list(retry))
-                copy_failed_ids = ClrList[ElementId]()  # clear failures
-            except Exception:
-                pass
-        # attempt views copy if any
-        if view_ids.Count > 0:
-            try:
-                v_new = ElementTransformUtils.CopyElements(doc, view_ids, doc, xf, opt)
-                views_copied = len(list(v_new))
-            except Exception:
-                views_failed = view_ids.Count
-        # recreate center lines that still failed by drawing model curves
-        if fail_by_cat.get("Center line") or fail_by_cat.get("Center Line"):
-            from Autodesk.Revit.DB import SketchPlane, Plane
 
-            for catlabel in ("Center line", "Center Line"):
-                ids_for_cat = fail_by_cat.get(catlabel, [])
-                for rid in ids_for_cat:
-                    try:
-                        e = doc.GetElement(rid)
-                        loc = getattr(e, "Location", None)
-                        if not loc or not hasattr(loc, "Curve"):
-                            continue
-                        curve = loc.Curve
-                        new_curve = curve.CreateTransformed(xf)
-                        # build a sketch plane that contains the curve
-                        try:
-                            dir = new_curve.ComputeDerivatives(0.5, True).BasisX
-                        except Exception:
-                            dir = None
-                        if dir is None:
-                            continue
-                        normal = dir.CrossProduct(XYZ.BasisZ)
-                        if normal.GetLength() < 1e-6:
-                            normal = dir.CrossProduct(XYZ.BasisX)
-                        if normal.GetLength() < 1e-6:
-                            normal = XYZ.BasisZ
-                        normal = normal.Normalize()
-                        plane = Plane.CreateByNormalAndOrigin(
-                            normal, new_curve.GetEndPoint(0)
-                        )
-                        sp = SketchPlane.Create(doc, plane)
-                        mc = doc.Create.NewModelCurve(new_curve, sp)
-                        copied += 1
-                        # add to mapping (best-effort)
-                        mapping_pairs.append((rid, mc.Id))
-                        # remove from skipped details
-                        skipped_details = [
-                            sd
-                            for sd in skipped_details
-                            if not (sd[1] == "copy fail" and sd[2] == catlabel)
-                        ]
-                    except Exception:
-                        continue
-        # recreate center lines that still failed by drawing model curves
-        if fail_by_cat.get("Center line") or fail_by_cat.get("Center Line"):
-            from Autodesk.Revit.DB import SketchPlane, Plane
-
-            for catlabel in ("Center line", "Center Line"):
-                ids_for_cat = fail_by_cat.get(catlabel, [])
-                for rid in ids_for_cat:
-                    try:
-                        e = doc.GetElement(rid)
-                        loc = getattr(e, "Location", None)
-                        if not loc or not hasattr(loc, "Curve"):
-                            continue
-                        curve = loc.Curve
-                        new_curve = curve.CreateTransformed(xf)
-                        # build a sketch plane that contains the curve
-                        try:
-                            dir = new_curve.ComputeDerivatives(0.5, True).BasisX
-                        except Exception:
-                            dir = None
-                        if dir is None:
-                            continue
-                        # choose a normal not parallel to dir
-                        normal = dir.CrossProduct(XYZ.BasisZ)
-                        if normal.GetLength() < 1e-6:
-                            normal = dir.CrossProduct(XYZ.BasisX)
-                        if normal.GetLength() < 1e-6:
-                            normal = XYZ.BasisZ
-                        normal = normal.Normalize()
-                        plane = Plane.CreateByNormalAndOrigin(
-                            normal, new_curve.GetEndPoint(0)
-                        )
-                        sp = SketchPlane.Create(doc, plane)
-                        doc.Create.NewModelCurve(new_curve, sp)
-                        copied += 1
-                        # remove from skipped details
-                        skipped_details = [
-                            sd
-                            for sd in skipped_details
-                            if not (sd[1] == "copy fail" and sd[2] == catlabel)
-                        ]
-                    except Exception:
-                        continue
-        t.Commit()
-    except Exception as ex:
-        t.RollBack()
-        TaskDialog.Show(
-            "transform_engine",
-            "Copy failed: {}\nModel elems: {}\nView-specific queued: {}\nSkipped invalid: {}".format(
-                ex, idlist.Count, vs_ids.Count, skipped_bad
-            ),
-        )
-        # log skipped details
-        if skipped_details:
-            print("Skipped (partial list):")
-            for sid, reason, cat in skipped_details[:50]:
-                print(" - Id {} | {} | {}".format(sid, reason, cat))
-        return
-
-    # assign systems to copied pipes/ducts based on source mapping
     sys_set = 0
     sys_fail = 0
     if mapping_pairs:
@@ -629,28 +532,151 @@ def main():
             except Exception:
                 sys_fail += 1
 
-    # print skipped summary
-    if skipped_details:
+    return {
+        "copied": copied,
+        "vs_copied": vs_copied,
+        "vs_failed": vs_failed,
+        "views_copied": views_copied,
+        "views_failed": views_failed,
+        "skipped_bad": skipped_bad,
+        "skipped_details": skipped_details,
+        "mapping_pairs": mapping_pairs,
+        "sys_set": sys_set,
+        "sys_fail": sys_fail,
+    }
+
+
+def main():
+    try:
+        src_sb = pick_scopebox("Pick SOURCE scope box")
+        tgt_sbs = pick_scopeboxes("Pick TARGET scope box(es) (ESC to finish)")
+    except Exception:
+        TaskDialog.Show("transform_engine", "Scope box selection cancelled.")
+        return
+
+    elems = pick_elements()
+    if not [e.Id for e in elems if e and e.IsValidObject]:
+        TaskDialog.Show(
+            "transform_engine",
+            "No elements provided (selection empty and no saved state found).",
+        )
+        return
+    if not tgt_sbs:
+        TaskDialog.Show("transform_engine", "No target scope boxes selected.")
+        return
+
+    try:
+        src_frame = build_frame_from_scopebox(src_sb)
+    except Exception as ex:
+        TaskDialog.Show("transform_engine", "Frame build failed: {}".format(ex))
+        return
+
+    total_copied = 0
+    total_vs_copied = 0
+    total_vs_failed = 0
+    total_views_copied = 0
+    total_views_failed = 0
+    total_skipped_bad = 0
+    total_sys_set = 0
+    total_sys_fail = 0
+    failed_targets = []
+    skipped_target_same = 0
+    all_skipped_details = []
+    processed = 0
+
+    tg = TransactionGroup(doc, "Transform Engine Copy (Multi)")
+    tg.Start()
+    try:
+        for idx, tgt_sb in enumerate(tgt_sbs):
+            if not tgt_sb or not tgt_sb.IsValidObject:
+                failed_targets.append("Target #{:02d} invalid".format(idx + 1))
+                continue
+            if tgt_sb.Id == src_sb.Id:
+                skipped_target_same += 1
+                print(
+                    "Target #{:02d} '{}' skipped: target is source".format(
+                        idx + 1, tgt_sb.Name
+                    )
+                )
+                continue
+            try:
+                tgt_frame = build_frame_from_scopebox(tgt_sb)
+            except Exception as ex:
+                failed_targets.append(
+                    "Target #{:02d} '{}' frame failed: {}".format(
+                        idx + 1, tgt_sb.Name, ex
+                    )
+                )
+                continue
+
+            print("=== Target #{:02d}: {} ===".format(idx + 1, tgt_sb.Name))
+            log_frame("Source", src_frame)
+            log_frame("Target #{:02d}".format(idx + 1), tgt_frame)
+            xf = compute_transform(src_frame, tgt_frame)
+            summarize_transform(xf)
+
+            t = Transaction(doc, "Transform Engine Copy -> {}".format(tgt_sb.Name))
+            try:
+                t.Start()
+                result = copy_to_target(xf, elems)
+                t.Commit()
+                processed += 1
+                total_copied += result["copied"]
+                total_vs_copied += result["vs_copied"]
+                total_vs_failed += result["vs_failed"]
+                total_views_copied += result["views_copied"]
+                total_views_failed += result["views_failed"]
+                total_skipped_bad += result["skipped_bad"]
+                total_sys_set += result["sys_set"]
+                total_sys_fail += result["sys_fail"]
+                all_skipped_details.extend(result["skipped_details"])
+            except Exception as ex:
+                try:
+                    t.RollBack()
+                except Exception:
+                    pass
+                failed_targets.append(
+                    "Target #{:02d} '{}' failed: {}".format(idx + 1, tgt_sb.Name, ex)
+                )
+                continue
+
+        tg.Assimilate()
+    except Exception:
+        try:
+            tg.RollBack()
+        except Exception:
+            pass
+        raise
+
+    if all_skipped_details:
         cat_counts = {}
-        for _, reason, cat in skipped_details:
+        for _, reason, cat in all_skipped_details:
             key = reason + " :: " + cat
             cat_counts[key] = cat_counts.get(key, 0) + 1
         print("Skipped breakdown (reason :: category):")
         for k, v in sorted(cat_counts.items(), key=lambda x: -x[1])[:20]:
             print(" - {} : {}".format(k, v))
-        print("Total skipped detailed: {}".format(len(skipped_details)))
+        print("Total skipped detailed: {}".format(len(all_skipped_details)))
+
+    if failed_targets:
+        print("Failed targets:")
+        for line in failed_targets:
+            print(" - {}".format(line))
 
     TaskDialog.Show(
         "transform_engine",
-        "Copied {} element(s).\nView-specific copied: {} | failed/skipped: {}\nViews copied: {} | failed/skipped: {}\nInvalid/unsupported skipped: {}\nSystems set: {} | failed: {}".format(
-            copied,
-            vs_copied,
-            vs_ids.Count - vs_copied + vs_failed,
-            views_copied,
-            views_failed,
-            skipped_bad,
-            sys_set,
-            sys_fail,
+        "Targets processed: {}\nFailed targets: {}\nSkipped targets (source): {}\nTotal copied elements: {}\nView-specific copied: {} | failed/skipped: {}\nViews copied: {} | failed/skipped: {}\nInvalid/unsupported skipped: {}\nSystems set: {} | failed: {}".format(
+            processed,
+            len(failed_targets),
+            skipped_target_same,
+            total_copied,
+            total_vs_copied,
+            total_vs_failed,
+            total_views_copied,
+            total_views_failed,
+            total_skipped_bad,
+            total_sys_set,
+            total_sys_fail,
         ),
     )
 
