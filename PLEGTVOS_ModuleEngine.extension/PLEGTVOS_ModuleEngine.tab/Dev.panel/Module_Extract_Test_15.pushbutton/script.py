@@ -1752,6 +1752,58 @@ def build_acceptance(payload):
     }
 
 
+def warning_group_name(message):
+    lower = str(message).lower()
+    if "no associated assembly views/sheets found or confirmed" in lower:
+        return "unconfirmed fully outside assemblies"
+    if (
+        "associated view lookup" in lower
+        or "associated view/sheet" in lower
+        or "fallback associated view" in lower
+    ):
+        return "assembly associated lookup warnings"
+    if "group" in lower:
+        return "Revit group deletion warnings"
+    if "assembly type" in lower or "empty assembly" in lower:
+        return "Revit assembly type deletion warnings"
+    return "other non-blocking warnings"
+
+
+def summarize_non_blocking_warnings(warnings):
+    order = [
+        "assembly associated lookup warnings",
+        "unconfirmed fully outside assemblies",
+        "Revit group deletion warnings",
+        "Revit assembly type deletion warnings",
+        "other non-blocking warnings",
+    ]
+    grouped = {}
+    for name in order:
+        grouped[name] = {"count": 0, "samples_first_5": []}
+    for warning in warnings or []:
+        name = warning_group_name(warning)
+        grouped[name]["count"] += 1
+        if len(grouped[name]["samples_first_5"]) < 5:
+            grouped[name]["samples_first_5"].append(str(warning))
+    return {"total_count": len(warnings or []), "groups": grouped}
+
+
+def print_warning_summary(summary):
+    print(" - non_blocking_warnings_summary:")
+    groups = summary.get("groups", {})
+    for name in [
+        "assembly associated lookup warnings",
+        "unconfirmed fully outside assemblies",
+        "Revit group deletion warnings",
+        "Revit assembly type deletion warnings",
+        "other non-blocking warnings",
+    ]:
+        group = groups.get(name, {"count": 0, "samples_first_5": []})
+        print("    {}: {}".format(name, group.get("count", 0)))
+        for sample in group.get("samples_first_5", []):
+            print("      sample: {}".format(sample))
+
+
 def print_report(payload):
     print("=" * 72)
     print("Module Extract Test - Phase 2 PROTOTYPE")
@@ -1984,6 +2036,8 @@ def print_report(payload):
     print("")
     print("Acceptance")
     acceptance = payload.get("acceptance", {})
+    if acceptance.get("accepted") and acceptance.get("output_reopened"):
+        print("ACCEPTED: output RVT reopened and verified.")
     print(" - accepted: {}".format(acceptance.get("accepted")))
     print(" - reason: {}".format(acceptance.get("reason")))
     print(" - source_unchanged: {}".format(acceptance.get("source_unchanged")))
@@ -1994,6 +2048,16 @@ def print_report(payload):
     print(" - verify unknown: {}".format(acceptance.get("verify_unknown_count")))
     print(" - pre crossing: {}".format(acceptance.get("pre_crossing_count")))
     print(" - crossing allowed: {}".format(acceptance.get("crossing_allowed")))
+    crossing_mep_count = payload.get("verify_refined_counts", {}).get(
+        "crossing_mep_count",
+        payload.get("pre_refined_counts", {}).get("crossing_mep_count", 0),
+    )
+    print(
+        "Preserved crossing physical candidates: {}".format(
+            acceptance.get("verify_crossing_count", 0)
+        )
+    )
+    print("Crossing MEP curves: {}".format(crossing_mep_count))
     print("")
     print("Result: {}".format(payload.get("result")))
     print("Revit warnings / failure processing messages")
@@ -2004,15 +2068,24 @@ def print_report(payload):
     else:
         print(" - blocking_errors: <none>")
     if payload.get("non_blocking_warnings"):
-        print(" - non_blocking_warnings:")
-        for msg in payload.get("non_blocking_warnings", [])[:50]:
-            print("    {}".format(msg))
+        print_warning_summary(
+            payload.get("non_blocking_warning_summary")
+            or summarize_non_blocking_warnings(payload.get("non_blocking_warnings", []))
+        )
     else:
         print(" - non_blocking_warnings: <none>")
-    if payload["delete_result"].get("failure_messages"):
+    if payload["delete_result"].get("failure_messages") and payload.get(
+        "blocking_errors"
+    ):
         print(" - raw messages:")
         for msg in payload["delete_result"]["failure_messages"][:50]:
             print(" - {}".format(msg))
+    elif payload["delete_result"].get("failure_messages"):
+        print(
+            " - raw messages: {} stored in JSON".format(
+                len(payload["delete_result"].get("failure_messages", []))
+            )
+        )
     print("")
     print("JSON latest: {}".format(payload.get("json_latest_path")))
 
@@ -2292,6 +2365,10 @@ def main():
         )
         payload["blocking_errors"] = blocking_errors
         payload["non_blocking_warnings"] = non_blocking_warnings
+        payload["non_blocking_warnings_full"] = non_blocking_warnings[:]
+        payload["non_blocking_warning_summary"] = summarize_non_blocking_warnings(
+            non_blocking_warnings
+        )
         save_json_report(payload)
         print_report(payload)
 
@@ -2398,6 +2475,10 @@ def main():
         )
         payload["blocking_errors"] = blocking_errors
         payload["non_blocking_warnings"] = non_blocking_warnings
+        payload["non_blocking_warnings_full"] = non_blocking_warnings[:]
+        payload["non_blocking_warning_summary"] = summarize_non_blocking_warnings(
+            non_blocking_warnings
+        )
         save_json_report(payload)
         print_report(payload)
         TaskDialog.Show(TOOL_NAME, "FAILED:\n{}".format(ex))
