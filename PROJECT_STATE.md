@@ -1,5 +1,38 @@
 # PLEGTVOS ModuleEngine project state
 
+## Current checkpoint — M1.0, 2026-10-11
+
+**M1_0_AUDIT_COMPLETE.** M1.0 is source analysis and documentation only. M1.1 implementation has not begun. Read the [GC01 mirror audit](docs/M1_GC01_MIRROR_AUDIT.md) for the actual recovered architecture, line-level findings, proposed diagnostic JSON and Revit 2025 acceptance matrix.
+
+- Verified entry state: branch `main`, clean worktree/index, HEAD `97d269ab009cea71528f4532bc1788874f7139ed`; live GitHub main advertised the same SHA.
+- Correct remote: `https://github.com/BIM3DNA/PLEGTVOS_ModuleEngine.git`. M0.1 stopped on the local documentation commit's divergence. Authorized M0.2 then rebased `72b68e8a` onto `f56f0ff`, producing `97d269ab`, and the subsequently approved normal push completed. The eight remote implementation commits and extractor scripts are now present locally.
+- M0.2 preserved all six documentation files and verified the full executable extension against `origin/main` at `f56f0ff`; syntax-only compilation passed for 31 files under IronPython 2.7.12. Those were offline checks, not Revit model acceptance. M1.0 also confirmed executable extension equality to `f56f0ff`.
+- Verified M0.2 backups: branch `backup/pre-m0-rebase-72b68e8`; complete Git bundle `C:\Users\Korisnik\AppData\Local\Temp\PLEGTVOS-M0.2-250c605f13bd4c159532f972b509a44d\pre-m0-rebase.bundle`. No new backup was needed for documentation-only M1.0.
+- M0.2 configuration and cached runtime assembly inspection identified the repository extension `C:\00_WORKS\DEVELOPMENT\PLEGTVOS_ModuleEngine\PLEGTVOS_ModuleEngine.extension`, with no duplicate Plechtvos source in configured roots. Reload was required to discover recovered buttons; completion of that reload and a new command invocation have not been observed here.
+- The existing README/M0 audit below describe earlier snapshots. Their absent-extractor/eight-commits-behind statements no longer describe current Git. Historical files/evidence remain preserved; this checkpoint supersedes their current-state implications.
+
+### Current findings and remaining gates
+
+Verified source findings include post-commit pin restoration; unisolated mirror fallback attempts; partial group assimilation; wrong ViewSection/CopyElements API calls; unvalidated rotated-scope axes; stale integer-ID state binding; reconnection not gating slope success; and counters recorded before outer transaction commit. The main slope loop does not attach its defined failure preprocessor, and its component builder is unused. Existing capture/slope commands are not read-only diagnostic entry points.
+
+These findings do not establish the actual cause of GC01's reported missing fittings, roof plates, cyan pipe damage, elbow/reducer orientation or reversed drainage. Those remain hypotheses pending a fixture, exact element/connector observations and approved transformation rules. No existing host success/failure report was replaced.
+
+Historical extraction evidence is retained below: GC01/02/04/06/07/08 were user-reported successes; the M0.1 brief specifically described GC12 as visually successful. No new host tests were performed during M0.2 or M1.0. All new matrix cases are NOT RUN.
+
+Alen/Emir decisions: approve L/R direction, mirror plane/anchors and center-versus-adjacent face placement; source/target GC01 fixtures; allowed boundary ports; VWA/HWA slope and flow/anchor rules; family/nested/host/group/assembly inclusion and handedness; geometric tolerances; target system identity; drawing/prefab codes and approval ownership. Existing code ratios .0075/.005 are not substituted for design approval.
+
+### Current next action and backlog
+
+After separate authorization, **M1.1 should implement only an independent read-only GC01 collector and deterministic JSON report**, with explicit unavailable/ambiguous data and no transaction, regeneration, isolation, geometry or connector manipulation. Do not import existing write buttons or change their behavior. Validate no-write behavior and report determinism in Revit 2025 before considering repairs. Prediction may remain UNRESOLVED until the team approves frames/tolerances; observation collection must not guess them.
+
+Then use the evidence to propose the smallest separate mirror/MEP repair scope. M2 drawing register, M3 sheets, M4 transfer, M5 linking QA and M6 variants retain their existing order and approval gates. Extractor behavior remains protected throughout.
+
+M1.0 change scope: PROJECT_STATE.md, docs/MILESTONES.md and new docs/M1_GC01_MIRROR_AUDIT.md only. No automatic commit/push, Python modification, Revit transaction, RVT generation or model write. Validation passed for six links/anchors, JSON skeleton, 17 finding and 14 test references, whitespace, exact change scope and `git diff --check`. Historical M0 state text and existing evidence files are preserved; the new audit remains untracked and changes are unstaged.
+
+## Historical M0 record — preserved, superseded for current state
+
+The following text records the M0 checkpoint before reconciliation. Its branch status, pending next action and file-status statements are historical, not the current state above.
+
 Audit date: 2026-10-11, Europe/Sarajevo. Active milestone: **M0 repository audit and project bootstrap**. Implementation remains stopped after M0.
 
 ## Verified repository state
