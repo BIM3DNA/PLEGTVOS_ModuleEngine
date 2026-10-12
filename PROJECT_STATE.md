@@ -1,6 +1,26 @@
 # PLEGTVOS ModuleEngine project state
 
-## Current checkpoint — M1.0, 2026-10-11
+## Current checkpoint - M1.1a instrumentation, 2026-10-11
+
+**FAILED_RUNTIME - UnicodeDecodeError. M1.1 is not accepted.** User-reported first run: Revit 2025 / pyRevit / IronPython 2.7.12, Original Motor A RVT, GC01 scope box (expected ElementId 1405931). Button appeared after reload, but collection failed and no JSON was generated. The original handler discarded the message and traceback; the actual failure boundary remains unknown.
+
+M1.1a adds failure-only protected traceback output with stage, element ID and field, including caught Unicode read failures. No model text normalization, schema, classification, connector, scope or slope changes. See the [exact retest procedure](docs/M1_1_HOST_ACCEPTANCE.md#m11a-runtime-investigation-and-retest). Root cause is not established; disposition is M1_1A_INSTRUMENTED.
+
+Validation: 25 offline tests pass; seven Python files compile with IronPython 2.7.12; a synthetic invalid-byte exception renders successfully under that engine. This does not reproduce the original host failure. Retest NOT RUN. No commit/push or M1.2 work.
+
+## Historical M1.1 implementation checkpoint - 2026-10-11
+
+M1.0 documentation was committed and normally pushed as `ba692cd913aab8eb9d5e77aa519696454fc75fed`; M1.1 began on clean `main` at that revision. The authorized independent **GC01 Mirror Diagnostics** button is implemented with four isolated Python files, bundle metadata and offline tests. Existing capture, placement, mirror, slope, state and extractor scripts remain unchanged. M1.1 changes are unstaged and uncommitted; no push was performed.
+
+Exactly one preselected scope box is required. The collector records conservative scope membership, physical MEP inventory, connector references, endpoint slope measurements, API issues and unresolved risks without model writes. Export is explicitly chosen: immutable JSON plus a dedicated diagnostic-only latest pointer under the state/reporting convention or an external root. Extractor acceptance records are untouched.
+
+Schema: `plegtvos.gc01_mirror_diagnostic/1`. Missing approved mirror anchors yields `MIRROR_FRAME_UNCONFIRMED`; hydraulic compliance and open-port intent remain UNKNOWN. Full dependency closure, non-shared family content, durable fixture comparison and target prediction remain unresolved. There is no mirror acceptance claim.
+
+Validation: 19 offline tests passed, including pure transforms/classification/slopes, identity, deterministic JSON, storage failures and static prohibited-API scanning. Four implementation files and the test file compiled with IronPython 2.7.12. Documentation and whitespace checks are recorded in the [M1.1 host procedure and ledger](docs/M1_1_HOST_ACCEPTANCE.md). **All 12 host cases are NOT RUN.** Reload pyRevit and verify loaded source/engine on an approved disposable fixture. No repair or later milestone is started.
+
+## Historical M1.0 checkpoint - 2026-10-11
+
+The following preserves the audit-time record; its unstaged/untracked and proposed implementation statements are superseded by the current checkpoint.
 
 **M1_0_AUDIT_COMPLETE.** M1.0 is source analysis and documentation only. M1.1 implementation has not begun. Read the [GC01 mirror audit](docs/M1_GC01_MIRROR_AUDIT.md) for the actual recovered architecture, line-level findings, proposed diagnostic JSON and Revit 2025 acceptance matrix.
 

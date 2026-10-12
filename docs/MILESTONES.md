@@ -1,6 +1,6 @@
 # Proposed milestone plan
 
-Updated: 2026-10-11. M0 and the separately authorized M0.2 reconciliation/normal push are complete at `97d269ab009cea71528f4532bc1788874f7139ed`. M1.0 documentation-only audit is complete. M1.1 and all model-writing work remain proposals requiring a new instruction. Owners and dates remain unassigned pending Alen/Emir decisions. Historical M0 scope below is retained.
+Updated: 2026-10-11. M0 and the separately authorized M0.2 reconciliation/normal push are complete at `97d269ab009cea71528f4532bc1788874f7139ed`. M1.0 documentation-only audit is complete. M1.1 independent read-only diagnostics were subsequently authorized and implemented; host acceptance remains NOT RUN. All model-writing work still requires a separate instruction. Owners and dates remain unassigned pending Alen/Emir decisions. Historical M0 scope below is retained.
 
 `P` means `PLEGTVOS_ModuleEngine.extension/PLEGTVOS_ModuleEngine.tab/Dev.panel/`. Paths below are expected scopes, not instructions to create every file. The recovered baseline now has seven pushbutton directories and nine plain feature directories. Do not accidentally re-enable archived commands. See [M1.0 architecture inventory](M1_GC01_MIRROR_AUDIT.md#architecture-inventory) for actual paths.
 
@@ -19,7 +19,7 @@ Every host record must identify Revit 2025 build, pyRevit engine, loaded extensi
 
 ## M1 — GC01 mirror reliability and MEP diagnostics
 
-Current subdivision: M1.0 audit complete; M1.1 independent read-only diagnostics proposed; mirror/slope repairs deferred until host evidence identifies the first failure boundary. The parent milestone's writing/repair goals below are not authorized by audit completion.
+Current subdivision: M1.0 audit complete; M1.1 independent read-only diagnostics implemented, host acceptance pending; mirror/slope repairs deferred until host evidence identifies the first failure boundary. The parent milestone's writing/repair goals below are not authorized by audit completion.
 
 - **Objective:** reproduce and locate the first GC01 left/right divergence, then implement the smallest authorized correction with connector and slope evidence.
 - **Dependencies:** approved baseline reconciliation preserving M0 docs and extractor bytes; loaded-path/engine verification; disposable GC01 fixture; agreed left/right plane, fixed reference/anchor, flow direction and slope units; historical extraction artifacts requested.
@@ -75,7 +75,7 @@ Current subdivision: M1.0 audit complete; M1.1 independent read-only diagnostics
 
 ## Immediate next work order
 
-Stop after M1.0 delivery. Reconciliation and push are complete. The next proposed work order is **M1.1: implement and validate only the independent read-only GC01 diagnostic collector** described in [M1_GC01_MIRROR_AUDIT.md](M1_GC01_MIRROR_AUDIT.md). No mirror/slope fix is part of that scope. See [PROJECT_STATE.md](../PROJECT_STATE.md) for domain decisions and unverified host evidence.
+M1.1 implementation is ready for manual Revit 2025 validation using [M1_1_HOST_ACCEPTANCE.md](M1_1_HOST_ACCEPTANCE.md). All host cases remain NOT RUN. Stop after implementation/offline validation; no automatic commit/push and no mirror/slope fix. Reconciliation and the M1.0 documentation push are complete. See [PROJECT_STATE.md](../PROJECT_STATE.md) for domain decisions and unverified host evidence.
 
 ## M0.2 checkpoint — completed reconciliation and push
 
@@ -95,11 +95,13 @@ Stop after M1.0 delivery. Reconciliation and push are complete. The next propose
 - **Acceptance criteria:** architecture graph, 13 requirement areas, line-level findings with causes/severity/remedy/test, deterministic report contract, acceptance matrix and explicit team decisions documented; documentation checks pass. Completed as documentation audit.
 - **Revit 2025 host-test requirements:** all proposed T01–T14 cases remain NOT RUN. No model manipulation or read-only command execution was needed for M1.0.
 
-## M1.1 — Proposed independent read-only diagnostic collector
+## M1.1 - Implemented read-only diagnostic collector; host acceptance pending
 
 - **Objective:** collect GC01 document/source/optional existing target, identity, geometry, dependency, system and connector evidence without modifying the model; serialize deterministic JSON.
-- **Dependencies:** new implementation authorization; recovered baseline and loaded path/engine/reload verification; approved GC01 fixture and export location; team input on frames/rules/tolerances for prediction. Unknown approvals allow observation-only reports with unresolved comparison, not guessed transforms.
-- **Files expected to change:** proposed new diagnostic pushbutton, minimal pure serialization/comparison helper if needed, focused tests and host acceptance ledger; project documentation. Existing Placement_05/06, Systems_07, module_state, extractors, Sheet Generator and Sheet Transfer remain unchanged.
+- **Dependencies:** implementation authorized by the M1.1 brief; recovered baseline and loaded path/engine/reload verification; approved GC01 fixture and export location; team input on frames/rules/tolerances for prediction. Unknown approvals allow observation-only reports with unresolved comparison, not guessed transforms.
+- **Files changed:** GC01_Mirror_Diagnostics.pushbutton (script, read adapter, pure core, report storage and bundle metadata), tests/test_gc01_diagnostics.py, docs/M1_1_HOST_ACCEPTANCE.md, PROJECT_STATE.md and this milestone record. Existing Placement_05/06, Systems_07, module_state, extractors, Sheet Generator and Sheet Transfer remain unchanged.
 - **Non-goals:** transactions (even rolled back), regeneration, views/isolation, geometry/parameter/connector writes, slope repair, copying/mirroring, saving/opening RVTs, importing write-command entry points or overwriting historical/latest state.
 - **Acceptance criteria:** conform to the proposed schema and deterministic sort/hash rules; explicit missing/unsupported/ambiguous data; stable document/UID and connector matching; physical/logical edge separation; no silent dropped dependencies; no prediction PASS with unresolved identity/frame/policy.
 - **Revit 2025 host-test requirements:** T01, T05 and T14 plus read-only observations for T04/T06/T08/T13; prove unchanged model/view/selection/Undo state, safe Cancel/export failure and reproducibility. Commit status remains host-acceptance pending until observed. All write/fault/Undo manipulation tests stay deferred to a separately authorized repair milestone.
+
+M1.1 scope is one preselected source scope box, no target comparison or approved mirror plane. Coverage/dependency closure remains unresolved rather than claiming module completeness. Dedicated timestamped diagnostic reports and latest-report.json are authorized by the M1.1 brief; extractor acceptance files remain untouched. See the host ledger for implementation limitations, offline evidence and the remaining release gates.
