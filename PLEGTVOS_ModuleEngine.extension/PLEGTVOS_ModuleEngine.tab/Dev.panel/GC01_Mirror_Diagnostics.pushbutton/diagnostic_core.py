@@ -5,7 +5,7 @@ import json
 import math
 
 VERSION = "1.1.0"
-SCHEMA = "plegtvos.gc01_mirror_diagnostic/1"
+SCHEMA = "plegtvos.gc01_mirror_diagnostic/4"
 EPS = 1e-7
 
 
@@ -157,6 +157,81 @@ def prediction():
             "unsupported_transformations": ["UNAPPROVED_FRAME", "TARGET_NOT_SELECTED"]}
 
 
+try:
+    text_type = unicode
+except NameError:
+    text_type = str
+try:
+    from System import String as net_string_type
+except ImportError:
+    net_string_type = ()
+
+
+class JsonTextError(UnicodeError):
+    """ASCII-only error details; no complete model value is printed."""
+    pass
+
+
+def _text_error(value, path, reason, offset=0):
+    preview = '-'
+    start = max(0, offset-8)
+    if isinstance(value, bytes) and not isinstance(value, text_type):
+        raw = value[start:start+16]
+        preview = ''.join('%02x' % (c if isinstance(c, int) else ord(c)) for c in raw)
+    message = ('JSON_TEXT_REJECTED path=%s; type=%s; encoding=utf-8/strict; '
+               'outcome=rejected; reason=%s; byte_offset=%s; hex_start=%s; hex=%s') % (
+                   path, type(value).__name__, reason, offset, start, preview)
+    raise JsonTextError(message.encode('ascii', 'backslashreplace').decode('ascii'))
+
+
+def ascii_json(encoded):
+    """Escape Unicode JSON output without IPY's str/unicode byte-decode ambiguity.
+
+    Input is already JSON-escaped by ensure_ascii=False; only non-ASCII code
+    points are escaped here, including valid JSON surrogate pairs for non-BMP.
+    """
+    result = []
+    for char in encoded:
+        code = ord(char)
+        if code < 127: result.append(char)
+        elif code <= 0xffff: result.append('\\u%04x' % code)
+        else:
+            code -= 0x10000
+            result.append('\\u%04x\\u%04x' % (0xd800+(code >> 10), 0xdc00+(code & 0x3ff)))
+    return ''.join(result)
+
+
+def json_text(value, path='$'):
+    """Copy only the JSON text boundary; never guess a legacy byte encoding.
+
+    Valid Unicode and numbers retain their values/types. UTF-8 bytes decode
+    strictly. Unknown bytes fail with a path and bounded hexadecimal evidence.
+    Existing numeric rounding remains solely in normalized(), below.
+    """
+    if isinstance(value, text_type): return value
+    if net_string_type and isinstance(value, net_string_type): return text_type(value)
+    if isinstance(value, bytes):
+        try: return value.decode('utf-8', 'strict')
+        except UnicodeError as error:
+            _text_error(value, path, 'UNKNOWN_BYTE_ENCODING', getattr(error, 'start', 0))
+    if isinstance(value, dict):
+        result = {}
+        for index, (key, child) in enumerate(value.items()):
+            key_path = path + '[<key:%d>]' % index
+            normalized_key = json_text(key, key_path)
+            if not isinstance(normalized_key, text_type):
+                _text_error(key, key_path, 'NON_TEXT_OBJECT_KEY')
+            child_path = path + '[' + ascii_json(json.dumps(normalized_key, ensure_ascii=False)) + ']'
+            if normalized_key in result:
+                _text_error(key, child_path, 'KEY_COLLISION_AFTER_UTF8_DECODE')
+            result[normalized_key] = json_text(child, child_path)
+        return result
+    if isinstance(value, (list, tuple)):
+        return [json_text(child, path+'[%d]' % index) for index, child in enumerate(value)]
+    # Preserve primitive types exactly; the JSON encoder still rejects unsupported objects.
+    return value
+
+
 def normalized(value):
     if isinstance(value, float):
         if math.isnan(value) or math.isinf(value): raise ValueError("Non-finite JSON value")
@@ -167,7 +242,7 @@ def normalized(value):
 
 
 def canonical(value):
-    return json.dumps(normalized(value), sort_keys=True, separators=(',', ':'), ensure_ascii=True, allow_nan=False)
+    return ascii_json(json.dumps(normalized(json_text(value)), sort_keys=True, separators=(',', ':'), ensure_ascii=False, allow_nan=False))
 
 
 def digest(value):
@@ -182,6 +257,7 @@ def connector_key(owner, descriptor):
 
 
 def finalize(snapshot):
+    snapshot = json_text(snapshot)  # Validate full paths before per-record sort keys.
     for field in ('elements', 'connectors', 'edges', 'systems', 'issues', 'predicted_risks', 'pipes'):
         snapshot[field] = sorted(snapshot.get(field, []), key=canonical)
     return normalized(snapshot)

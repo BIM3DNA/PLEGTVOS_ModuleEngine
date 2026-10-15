@@ -15,26 +15,27 @@ def suggested_root(document):
                         'pyRevit', 'PLEGTVOS_ModuleEngine', 'state')
 
 
-def exclusive_write(path, value):
+def exclusive_write(path, value, control=None):
+    encoded = ((control.canonical(value) if control else core.canonical(value)) + '\n').encode('utf-8')
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_BINARY', 0), 0o600)
     with os.fdopen(descriptor, 'wb') as stream:
-        stream.write((core.canonical(value) + '\n').encode('utf-8'))
+        stream.write(encoded)
         stream.flush()
         os.fsync(stream.fileno())
 
 
-def save(report, root):
+def save(report, root, control=None):
     folder = os.path.join(root, 'gc01_mirror_diagnostics', report['snapshot']['document']['key'])
     if not os.path.isdir(folder): os.makedirs(folder)
     name = 'gc01_' + datetime.utcnow().strftime('%Y%m%dT%H%M%S%fZ') + '_' + uuid.uuid4().hex + '.json'
     path = os.path.join(folder, name)
-    exclusive_write(path, report)
+    exclusive_write(path, report, control)
     pointer = dict(schema=core.SCHEMA, feature_id='GC01_MIRROR_DIAGNOSTICS',
                    report=name, content_sha256=report['content_sha256'])
     temporary = os.path.join(folder, 'latest_' + uuid.uuid4().hex + '.tmp')
     latest = os.path.join(folder, 'latest-report.json')
     try:
-        exclusive_write(temporary, pointer)
+        exclusive_write(temporary, pointer, control)
         if hasattr(os, 'replace'):
             os.replace(temporary, latest)
         else:

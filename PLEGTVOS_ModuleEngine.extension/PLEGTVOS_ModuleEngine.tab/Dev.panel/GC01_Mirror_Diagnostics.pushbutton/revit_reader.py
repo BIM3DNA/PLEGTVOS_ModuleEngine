@@ -4,6 +4,7 @@ from Autodesk.Revit import DB
 import diagnostic_core as core
 import failure_diagnostics
 import sys
+import execution_control
 
 CATEGORIES = ('OST_PipeCurves', 'OST_FlexPipeCurves', 'OST_PipeFitting',
               'OST_PipeAccessory', 'OST_DuctCurves', 'OST_FlexDuctCurves',
@@ -31,11 +32,20 @@ def transform(t):
                 basis_y=xyz(t.BasisY), basis_z=xyz(t.BasisZ))
 
 
+def builtin_category_list():
+    # Explicit typed ICollection selects the Revit BuiltInCategory overload.
+    from System.Collections.Generic import List
+    return List[DB.BuiltInCategory]()
+
+
 class Reader(object):
-    def __init__(self, doc):
+    def __init__(self, doc, control=None):
         self.doc = doc
+        self.control = control or execution_control.Control()
+        self.element_cache = {}
         self.issues = []
         self.systems = {}
+        self.expected_absences = {}
         self.doc_key = 'UNRESOLVED_DOCUMENT'
         self.context = dict(stage='initialization', element_id=None, field=None)
         self.unicode_failures = []
@@ -45,19 +55,30 @@ class Reader(object):
                                 subject_key=subject, field=field, reason=reason,
                                 evidence_kind='OBSERVED_READ', message=reason))
 
-    def read(self, subject, field, getter):
+    def read(self, subject, field, getter, optional=False):
         previous_field = self.context['field']
         self.context['field'] = field
         try:
-            value = getter()
+            self.control.check()
+            value = self.control.text(getter())
+            self.control.check()
             if value is None:
-                self.issue(subject, field)
+                if optional:
+                    self.expected_absences[field] = self.expected_absences.get(field, 0) + 1
+                else:
+                    self.issue(subject, field)
             return value
+        except execution_control.Stopped:
+            raise
         except Exception as error:
             if isinstance(error, UnicodeError):
-                self.unicode_failures.extend(failure_diagnostics.failure_lines(sys.exc_info(), dict(self.context)))
+                if len(self.unicode_failures) >= self.control.limits['unicode_failures']:
+                    raise execution_control.Stopped('UNICODE_FAILURE_LIMIT; see earlier failures')
+                self.unicode_failures.append(failure_diagnostics.failure_lines(sys.exc_info(), dict(self.context)))
             self.issue(subject, field, 'READ_ERROR')
             self.issues[-1]['exception_type'] = type(error).__name__
+            self.issues[-1]['context'] = dict(self.context)
+            self.issues[-1]['traceback'] = failure_diagnostics.failure_lines(sys.exc_info(), dict(self.context))
             return None
         finally:
             self.context['field'] = previous_field
@@ -70,9 +91,16 @@ class Reader(object):
                     key=self.doc_key + '/' + (uid or ('unresolved-id-' + str(ident))),
                     name=self.read(uid or ident, 'name', lambda: element.Name))
 
+    def lookup(self, ident):
+        key = eid(ident)
+        if key not in self.element_cache:
+            self.control.check()
+            self.element_cache[key] = self.doc.GetElement(ident)
+        return self.element_cache[key]
+
     def related(self, owner, field, ident):
         if ident is None or eid(ident) == '-1': return None
-        element = self.read(owner, field, lambda: self.doc.GetElement(ident))
+        element = self.read(owner, field, lambda: self.lookup(ident))
         return self.ref(element)
 
     def bbox(self, element):
@@ -90,7 +118,7 @@ class Reader(object):
     def geometry(self, scope):
         segments = []
         geometry = scope.get_Geometry(DB.Options())
-        for obj in geometry:
+        for obj in self.control.items(geometry, 'geometry_objects'):
             if isinstance(obj, DB.Line):
                 segments.append([xyz(obj.GetEndPoint(0)), xyz(obj.GetEndPoint(1))])
             else:
@@ -113,7 +141,8 @@ class Reader(object):
 
     def params(self, element, key):
         result = {}
-        for name in PARAMETERS:
+        for name in PARAMETERS[:self.control.limits['parameters']]:
+            if self.control.limits['parameters'] < len(PARAMETERS): self.control.limit('parameters')
             def get(name=name):
                 param = element.get_Parameter(getattr(DB.BuiltInParameter, name))
                 if param is None: return dict(status='NOT_APPLICABLE', value=None)
@@ -122,7 +151,7 @@ class Reader(object):
                 getters = {'Double': param.AsDouble, 'Integer': param.AsInteger,
                            'String': param.AsString, 'ElementId': lambda: eid(param.AsElementId())}
                 return dict(status='READ', storage_type=storage,
-                            value=getters[storage](), units='REVIT_INTERNAL')
+                            value=self.control.text(getters[storage]()), units='REVIT_INTERNAL')
             result[name] = self.read(key, name, get)
         return result
 
@@ -130,7 +159,7 @@ class Reader(object):
         if system is None: return None
         ref = self.ref(system); key = ref['key']
         if key not in self.systems:
-            ref['type_ref'] = self.read(key, 'system_type', lambda: self.ref(self.doc.GetElement(system.GetTypeId())))
+            ref['type_ref'] = self.read(key, 'system_type', lambda: self.ref(self.lookup(system.GetTypeId())))
             ref['classification'] = self.read(key, 'classification', lambda: str(system.SystemType))
             ref['member_keys'] = []
             ref['coverage'] = 'OBSERVED_CONNECTOR_AND_ELEMENT_REFERENCES_ONLY'
@@ -173,18 +202,25 @@ class Reader(object):
             self.issue(key, 'connector_manager', 'UNSUPPORTED')
             manager = None
         if manager is None: return None, []
-        connectors = self.read(key, 'connectors', lambda: list(manager.Connectors))
+        connectors = self.read(key, 'connectors', lambda: manager.Connectors)
         if connectors is None: return None, []
         result, edges = [], []
-        for connector in connectors:
+        for connector in self.control.items(connectors, 'connectors_per_element', 'connectors'):
             current = self.descriptor(connector, key)
-            refs = self.read(current['key'], 'all_refs', lambda: list(connector.AllRefs))
+            refs = None
+            if self.control.counts.get('references', 0) >= self.control.limits['references']:
+                self.control.limit('references')
+            else:
+                refs = self.read(current['key'], 'all_refs', lambda: connector.AllRefs)
             current['references'] = []
             current['open_port_assessment'] = 'UNKNOWN_ENGINEERING_INTENT'
-            for other in refs or []:
+            seen_refs = set()
+            for other in self.control.items(refs or [], 'references_per_connector', 'references'):
                 owner = self.read(current['key'], 'reference_owner', lambda: self.ref(other.Owner))
                 if owner is None: continue
                 other_row = self.descriptor(other, owner['key'])
+                if other_row['key'] in seen_refs: continue
+                seen_refs.add(other_row['key'])
                 logical = current['connector_type'] == 'Logical' or other_row['connector_type'] == 'Logical'
                 physical_types = ('End', 'Curve', 'Physical')
                 physical_candidate = current['connector_type'] in physical_types and other_row['connector_type'] in physical_types
@@ -211,7 +247,11 @@ class Reader(object):
         line = loc.get('endpoints_ft') if loc.get('is_line') else None
         row['membership'] = core.classify((row['bbox'] or {}).get('corners_ft'), frame, line)
         if row['membership'] == 'UNKNOWN': self.issue(key, 'membership', 'UNAVAILABLE', 'SCOPE_MEMBERSHIP_UNKNOWN')
-        typ = self.read(key, 'type', lambda: self.doc.GetElement(element.GetTypeId()))
+        if self.control.mode == 'FAST' or row['membership'] == 'OUTSIDE':
+            row.update(family_type={}, parameters={}, system_key=None, dependencies=[],
+                       detail_status='NOT_INSPECTED_FAST' if self.control.mode == 'FAST' else 'OUTSIDE_SCOPE')
+            return row
+        typ = self.read(key, 'type', lambda: self.lookup(element.GetTypeId()))
         row['family_type'] = dict(type_ref=self.ref(typ), family=None)
         if typ:
             row['family_type']['family'] = self.read(key, 'family', lambda: typ.FamilyName)
@@ -234,20 +274,59 @@ class Reader(object):
             row['orientation']['transform'] = self.read(key, 'transform', lambda: transform(element.GetTransform()))
             host = self.read(key, 'host', lambda: self.ref(element.Host))
             if host: row['dependencies'].append(dict(relation='HOST', element=host))
-            subids = self.read(key, 'subcomponents', lambda: list(element.GetSubComponentIds()))
-            for ident in subids or []:
+            subids = self.read(key, 'subcomponents', lambda: element.GetSubComponentIds())
+            for ident in self.control.items(subids or [], 'dependencies'):
                 row['dependencies'].append(dict(relation='SHARED_SUBCOMPONENT', element=self.related(key, 'subcomponent', ident)))
             self.issue(key, 'non_shared_nested_content', 'UNSUPPORTED', 'OPAQUE_FAMILY_CONTENT')
         for field in ('group', 'assembly'):
             if row[field]: row['dependencies'].append(dict(relation=field.upper(), element=row[field]))
-        dependent_ids = self.read(key, 'dependents', lambda: list(element.GetDependentElements(None)))
-        for ident in dependent_ids or []:
+        dependent_ids = self.read(key, 'dependents', lambda: element.GetDependentElements(None))
+        for ident in self.control.items(dependent_ids or [], 'dependencies'):
             if eid(ident) != row['id']:
                 row['dependencies'].append(dict(relation='OTHER', element=self.related(key, 'dependent', ident)))
         row['dependencies'] = sorted(row['dependencies'], key=core.canonical)
         return row
 
+    def prepare_categories(self, enum_values=None):
+        # Preserve the original conversion and supported-name order; isolate for tests.
+        if enum_values is None: enum_values = DB.BuiltInCategory
+        self.context.update(stage='category_setup', element_id=None, field=None)
+        self.control.progress('Category setup / enum conversion before', total=len(CATEGORIES))
+        categories = {}
+        for name in CATEGORIES:
+            self.context['field'] = name
+            value = self.read('inventory', name, lambda name=name: str(int(getattr(enum_values, name))))
+            if value: categories[value] = name
+        self.context['field'] = None
+        self.control.progress('Category setup / enum conversion after', len(CATEGORIES), len(CATEGORIES))
+        return categories
+
+    def category_filter(self, categories):
+        if len(categories) != len(CATEGORIES) or set(categories.values()) != set(CATEGORIES):
+            raise execution_control.Stopped('CATEGORY_FILTER_INCOMPLETE; no partial supported set allowed')
+        self.candidate_checkpoint('native_category_list_before')
+        values = builtin_category_list()
+        for name in CATEGORIES:
+            self.context['field'] = name
+            value = getattr(DB.BuiltInCategory, name)
+            if categories.get(str(int(value))) != name:
+                raise execution_control.Stopped('CATEGORY_FILTER_IDENTITY_MISMATCH')
+            values.Add(value)
+        self.candidate_checkpoint('native_category_list_after; multicategory_filter_before')
+        result = DB.ElementMulticategoryFilter(values)
+        try:
+            self.candidate_checkpoint('multicategory_filter_after')
+            return result
+        except Exception:
+            result.Dispose()
+            raise
+
+    def candidate_checkpoint(self, operation):
+        self.context.update(stage='candidate_collection_setup', element_id=None, field=operation)
+        self.control.progress('Collect candidate elements / ' + operation, force=True)
+
     def collect(self, scope):
+        self.control.progress('Resolve scope box', element_id=eid(scope.Id))
         self.context.update(stage='document_identity', element_id=eid(scope.Id), field=None)
         doc = self.doc
         identity = {}
@@ -259,7 +338,20 @@ class Reader(object):
             ('active_view_unique_id', lambda: doc.ActiveView.UniqueId),
             ('is_cloud', lambda: bool(doc.IsModelInCloud))):
             identity[field] = self.read('document', field, getter)
-        identity['central_guid'] = self.read('document', 'central_guid', lambda: str(doc.WorksharingCentralGUID)) if identity['is_workshared'] else None
+        identity['central_guid'] = None
+        identity['central_guid_status'] = 'NOT_APPLICABLE_NOT_WORKSHARED'
+        if identity['is_workshared']:
+            identity['central_guid_status'] = 'UNAVAILABLE'
+            central_path = self.read('document', 'central_model_path', lambda: doc.GetWorksharingCentralModelPath())
+            if central_path is not None:
+                server = self.read('document', 'central_path_server', lambda: bool(central_path.ServerPath))
+                empty = self.read('document', 'central_path_empty', lambda: bool(central_path.Empty))
+                if server is False and empty is False:
+                    # The documented GUID contract only applies to Revit Server.
+                    identity['central_guid_status'] = 'NOT_APPLICABLE_NON_SERVER_CENTRAL'
+                elif server is True:
+                    identity['central_guid'] = self.read('document', 'central_guid', lambda: str(doc.WorksharingCentralGUID))
+                    if identity['central_guid']: identity['central_guid_status'] = 'AVAILABLE'
         identity['cloud_project_guid'] = None; identity['cloud_model_guid'] = None
         if identity['is_cloud']:
             modelpath = self.read('document', 'cloud_path', lambda: doc.GetCloudModelPath())
@@ -279,47 +371,119 @@ class Reader(object):
         source['frame'] = frame
         if frame is None: self.issue('scope', 'frame', 'UNSUPPORTED', 'SCOPE_FRAME_UNAVAILABLE')
         self.issue('prediction', 'frame', 'UNAVAILABLE', 'MIRROR_FRAME_UNCONFIRMED')
-        self.context.update(stage='category_setup', element_id=None, field=None)
-        categories = {}
-        for name in CATEGORIES:
-            value = self.read('inventory', name, lambda name=name: str(int(getattr(DB.BuiltInCategory, name))))
-            if value: categories[value] = name
+        categories = self.prepare_categories()
         rows, connectors, edges, pipes, excluded = [], [], [], [], {}
-        # Document-wide model collector; never active-view restricted.
-        for element in DB.FilteredElementCollector(doc).WhereElementIsNotElementType():
-            self.context.update(stage='element_inventory', element_id=eid(element.Id), field=None)
-            cat = self.read('inventory', 'category', lambda: element.Category)
-            if cat is None: continue
-            category_id = eid(cat.Id)
-            if category_id not in categories:
-                # Unsupported model categories retained in a count ledger, not represented as scanned MEP.
-                if cat.CategoryType == DB.CategoryType.Model:
-                    entry = excluded.setdefault(category_id, dict(category_id=category_id, name=cat.Name, count=0, reason='OUTSIDE_SUPPORTED_MEP_CATEGORY_SET'))
+        self.control.progress('Collect candidate elements')
+        candidates = []
+        seen_ids, seen_keys = set(), set()
+        duplicate_count = 0
+        identity_missing = False
+        collector = None
+        native_filter = None
+        bounded = None
+        try:
+            native_filter = self.category_filter(categories)
+            self.candidate_checkpoint('collector_constructor_before')
+            collector = DB.FilteredElementCollector(doc)
+            self.candidate_checkpoint('collector_constructor_after; instance_filter_before')
+            collector = collector.WhereElementIsNotElementType()
+            self.candidate_checkpoint('instance_filter_after; category_filter_apply_before')
+            collector = collector.WherePasses(native_filter)
+            self.candidate_checkpoint('category_filter_apply_after; bounded_iterator_create_before')
+            bounded = self.control.element_items(collector, 'scanned_elements', checkpoint=self.candidate_checkpoint)
+            self.candidate_checkpoint('bounded_iterator_created; first_iteration_before')
+            for element in bounded:
+                self.context.update(stage='candidate_collection', element_id=eid(element.Id), field=None)
+                self.control.progress('Collect supported-category instances', self.control.counts['scanned_elements'], element_id=eid(element.Id))
+                ident = eid(element.Id)
+                if ident in seen_ids:
+                    duplicate_count += 1
+                    self.issue(ident, 'identity', 'AMBIGUOUS', 'DUPLICATE_ELEMENT_ID')
+                    continue
+                seen_ids.add(ident)
+                cat = self.read(eid(element.Id), 'category', lambda: element.Category, optional=True)
+                category_id = self.read(eid(element.Id), 'category_id', lambda: eid(cat.Id)) if cat is not None else None
+                if category_id not in categories:
+                    self.issue(ident, 'category', 'UNAVAILABLE', 'FILTERED_CATEGORY_UNVERIFIED')
+                    excluded_key = category_id or 'NO_CATEGORY_OR_READ_ERROR'
+                    entry = excluded.setdefault(excluded_key, dict(category_id=category_id, count=0,
+                        status='NOT_IN_SUPPORTED_CATEGORY_SET' if category_id else 'NO_CATEGORY_OR_READ_ERROR'))
                     entry['count'] += 1
-                continue
-            row = self.read(eid(element.Id), 'element_record', lambda: self.element(element, frame))
-            if row is None:
-                row = self.ref(element); row.update(membership='UNKNOWN', collection_status='READ_ERROR')
-                source['element_keys'].append(row['key'])
-                rows.append(row); continue
-            row['inclusion_reason'] = 'DOCUMENT_WIDE_PHYSICAL_MEP_CATEGORY'
-            rows.append(row)
-            if row['membership'] == 'OUTSIDE':
-                row['connector_count'] = None; row['connector_scan'] = 'OUTSIDE_SCOPE_NOT_SCANNED'
-                continue
-            source['element_keys'].append(row['key'])
-            self.context.update(stage='connectors', field=None)
-            cs, es = self.connectors(element, row)
-            row['connector_count'] = len(cs) if cs is not None else None
-            row['connector_scan'] = 'COLLECTED' if cs is not None else 'UNAVAILABLE'
-            row['connector_keys'] = sorted(c['key'] for c in cs or [])
-            connectors.extend(cs or []); edges.extend(es)
-            if categories[category_id] in ('OST_PipeCurves', 'OST_FlexPipeCurves'):
-                self.context.update(stage='pipe_slopes', field=None)
+                    continue
+                self.context.update(stage='scope_classification', element_id=eid(element.Id), field=None)
+                row = self.read(eid(element.Id), 'element_record', lambda: self.element(element, frame))
+                if row is None:
+                    row = self.ref(element)
+                    row.update(membership='UNKNOWN', collection_status='READ_ERROR', location=None,
+                               parameters={}, system_key=None)
+                row.update(inclusion_reason='SCOPE_FIRST_BOUNDED_DOCUMENT_MEP_INVENTORY', connector_count=None,
+                    connector_scan='NOT_INSPECTED_FAST' if self.control.mode == 'FAST' else 'OUTSIDE_SCOPE_NOT_SCANNED')
+                if not row.get('unique_id') or not row.get('id'):
+                    identity_missing = True
+                if row['key'] in seen_keys:
+                    duplicate_count += 1
+                    self.issue(row['key'], 'identity', 'AMBIGUOUS', 'DUPLICATE_ELEMENT_KEY')
+                    continue
+                seen_keys.add(row['key'])
+                candidates.append((element, row))
+        finally:
+            try:
+                if bounded is not None: bounded.close()
+            finally:
+                try:
+                    if collector is not None: collector.Dispose()
+                finally:
+                    if native_filter is not None: native_filter.Dispose()
+        # Classification is bounded by scanned_elements. Stable identity decides which
+        # details survive a cap, independently of collector enumeration order.
+        self.control.progress('Classify candidates / apply scope budgets', len(candidates), len(candidates))
+        candidates.sort(key=lambda pair: pair[1]['key'])
+        ledger = []
+        memberships = dict(INSIDE=0, CROSSING=0, OUTSIDE=0, UNKNOWN=0)
+        selected = []
+        used = dict(candidates=0, unknown_candidates=0)
+        for element, row in candidates:
+            self.control.check()
+            membership = row['membership']
+            memberships[membership] += 1
+            detail = False
+            if membership != 'OUTSIDE':
+                budget = 'unknown_candidates' if membership == 'UNKNOWN' else 'candidates'
+                if (self.control.mode == 'FAST' and budget == 'candidates') or used[budget] < self.control.limits[budget]:
+                    used[budget] += 1
+                    detail = True
+                    rows.append(row)
+                    source['element_keys'].append(row['key'])
+                    selected.append((element, row))
+                else:
+                    self.control.limit(budget)
+            ledger.append(dict(key=row['key'], id=row['id'], category_id=row.get('category_id'),
+                               membership=membership, detail_retained=detail))
+        self.control.counts.update(used)
+        del candidates
+        self.control.progress('Inspect connector topology' + (' (skipped FAST)' if self.control.mode == 'FAST' else ''), total=len(selected))
+        if self.control.mode == 'FULL':
+            for index, (element, row) in enumerate(selected):
+                self.context.update(stage='connectors', element_id=eid(element.Id), field=None)
+                self.control.progress('Inspect connector topology', index, len(selected), eid(element.Id))
+                if self.control.counts.get('connectors', 0) >= self.control.limits['connectors']:
+                    self.control.limit('connectors'); break
+                cs, es = self.connectors(element, row)
+                row['connector_count'] = len(cs) if cs is not None else None
+                row['connector_scan'] = 'BOUNDED' if cs is not None else 'UNAVAILABLE'
+                row['connector_keys'] = sorted(c['key'] for c in cs or [])
+                connectors.extend(cs or []); edges.extend(es)
+        self.control.progress('Inspect pipe slopes', total=len(selected))
+        for index, (element, row) in enumerate(selected):
+            if index % min(500, self.control.limits['candidates']) == 0:
+                self.control.progress('FAST detail batch boundary' if self.control.mode == 'FAST' else 'Detail boundary', index, len(selected), eid(element.Id), force=True)
+            self.control.progress('Inspect pipe slopes', index, len(selected), eid(element.Id))
+            self.context.update(stage='pipe_slopes', element_id=eid(element.Id), field=None)
+            if categories.get(row.get('category_id')) in ('OST_PipeCurves', 'OST_FlexPipeCurves'):
                 loc = row['location'] or {}
                 measurement = core.slope(loc.get('endpoints_ft'), loc.get('is_line', False))
                 measurement.update(element_key=row['key'], length_ft=loc.get('length_ft'),
-                                   revit_slope_parameter=row['parameters'].get('RBS_PIPE_SLOPE'), system_key=row['system_key'])
+                    revit_slope_parameter=row['parameters'].get('RBS_PIPE_SLOPE'), system_key=row['system_key'])
                 pipes.append(measurement)
         self.context.update(stage='connector_summary', element_id=None, field=None)
         membership = dict((r['key'], r['membership']) for r in rows)
@@ -354,16 +518,24 @@ class Reader(object):
                        physical_boundary_edges=sum(e['kind']=='PHYSICAL' and any(o['boundary'] is True for o in e['observations']) for e in edges),
                        pipes=len(pipes), measured_slopes=sum(p['status']=='MEASURED' for p in pipes),
                        vertical_pipes=sum(p['status']=='VERTICAL' for p in pipes),
-                       unsupported_categories=len(excluded),
+                       unsupported_categories=None,
                        missing_family_type=sum(not (r.get('family_type') or {}).get('type_ref') or not (r.get('family_type') or {}).get('family') for r in candidates))
+        if self.control.mode == 'FAST':
+            for name in ('connector_bearing_elements', 'connectors', 'connected', 'unconnected',
+                         'connection_unknown', 'boundary_connectors', 'physical_boundary_edges', 'missing_family_type'):
+                summary[name] = None
         self.context.update(stage='coordinates', element_id=None, field=None)
         coordinates = dict(space='REVIT_INTERNAL', length_unit='ft', angle_unit='rad',
                            project_location=self.read('coordinates', 'project_location', lambda: self.ref(doc.ActiveProjectLocation)),
                            shared_transform=self.read('coordinates', 'shared_transform', lambda: transform(doc.ActiveProjectLocation.GetTotalTransform())),
                            architectural_links=[], reference_points=[])
-        for link in DB.FilteredElementCollector(doc).OfClass(DB.RevitLinkInstance):
-            self.context.update(stage='link_coordinates', element_id=eid(link.Id), field=None)
-            coordinates['architectural_links'].append(dict(instance=self.ref(link), transform=self.read(eid(link.Id), 'link_transform', lambda: transform(link.GetTotalTransform()))))
+        link_collector = DB.FilteredElementCollector(doc).OfClass(DB.RevitLinkInstance) if self.control.mode == 'FULL' else None
+        try:
+            for link in self.control.items(link_collector or [], 'links'):
+                self.context.update(stage='link_coordinates', element_id=eid(link.Id), field=None)
+                coordinates['architectural_links'].append(dict(instance=self.ref(link), transform=self.read(eid(link.Id), 'link_transform', lambda: transform(link.GetTotalTransform()))))
+        finally:
+            if link_collector is not None: link_collector.Dispose()
         self.context.update(stage='coordinate_sort', element_id=None, field='architectural_links')
         coordinates['architectural_links'].sort(key=core.canonical)
         self.issue('coverage', 'dependencies', 'UNSUPPORTED', 'DEPENDENCY_CLOSURE_UNRESOLVED')
@@ -376,21 +548,70 @@ class Reader(object):
                 risks.append(dict(code='OPEN_CONNECTOR_REQUIRES_ENGINEERING_REVIEW',
                     subject_keys=[connector['key']], confidence='OBSERVED_SOURCE_CONDITION',
                     blocking=False, confirmed_defect=False))
+        summary['classifications'] = memberships
         summary['unresolved_issues'] = len(self.issues)
         summary['api_extraction_errors'] = sum(i['reason']=='READ_ERROR' for i in self.issues)
         summary['predicted_mirror_risks'] = len(risks)
+        summary['issue_counts_by_reason'] = {}
+        for issue in self.issues:
+            reason = issue['reason']
+            summary['issue_counts_by_reason'][reason] = summary['issue_counts_by_reason'].get(reason, 0) + 1
         source['element_keys'].sort()
+        self.control.progress('Calculate mirror preview (unapproved; no transform applied)')
         preview = core.prediction()
         preview['source_frame'] = frame
         self.context.update(stage='snapshot_finalize', element_id=None, field='snapshot')
-        return core.finalize(dict(document=identity, coordinates=coordinates, source=source,
+        self.control.check()
+        snapshot = core.finalize(dict(document=identity, coordinates=coordinates, source=source,
             target=dict(status='NOT_SELECTED', scope_box=None, element_keys=[], matches=[]),
             prediction=preview, confirmed_defects=[], policy=dict(approval_reference=None, allowed_open_ports=[], slope_rules=[],
                 position_tolerance_ft=None, angle_tolerance_rad=None, slope_tolerance_ratio=None,
                 inclusion_rules=list(CATEGORIES)),
             coverage=dict(complete=False, candidate_count=len(candidates), element_count=len(rows),
                 counts_by_category=sorted([dict(category_id=k, count=v) for k, v in counts.items()], key=core.canonical),
-                excluded=sorted(excluded.values(), key=core.canonical), limits_reached=[],
+                excluded=None, filtered_category_anomalies=sorted(excluded.values(), key=core.canonical), limits_reached=[],
                 opaque_dependencies=['NON_SHARED_FAMILY_CONTENT', 'DEPENDENCY_CLOSURE_NOT_PROVEN']),
             elements=rows, connectors=connectors, edges=edges, systems=list(self.systems.values()),
             pipes=pipes, issues=self.issues, predicted_risks=risks, summary=summary))
+
+        snapshot['coverage'].update(self.control.coverage())
+        snapshot['coverage']['excluded_category_inventory'] = 'NOT_INSPECTED_BY_FILTERED_COLLECTION'
+        snapshot['coverage']['scanned_elements_basis'] = 'SUPPORTED_CATEGORY_INSTANCES_INSPECTED'
+        snapshot['coverage']['collector_filter'] = dict(kind='ElementMulticategoryFilter',
+            element_types=False, supported_categories=list(CATEGORIES), category_ids=categories)
+        snapshot['coverage']['duplicate_observations'] = duplicate_count
+        snapshot['coverage']['classification_ledger'] = ledger
+        snapshot['coverage']['classification_counts'] = memberships
+        snapshot['coverage']['scan_exhausted'] = bool(bounded is not None and bounded.exhausted)
+        blockers = list(self.control.truncated)
+        if not snapshot['coverage']['scan_exhausted']: blockers.append('COLLECTOR_EXHAUSTION_UNPROVEN')
+        if frame is None: blockers.append('SCOPE_FRAME_UNAVAILABLE')
+        if memberships['UNKNOWN']: blockers.append('UNKNOWN_MEMBERSHIP')
+        if summary['api_extraction_errors']: blockers.append('API_READ_ERRORS')
+        if excluded: blockers.append('FILTERED_CATEGORY_UNVERIFIED')
+        if duplicate_count: blockers.append('DUPLICATE_IDENTITIES')
+        if (identity_missing or not identity['path'] or not identity['project_info_unique_id']
+                or not source['scope_box'].get('unique_id')):
+            blockers.append('IDENTITY_UNAVAILABLE')
+        snapshot['coverage']['inventory_blockers'] = sorted(set(blockers))
+        snapshot['coverage']['classification_inventory_complete'] = not [
+            value for value in blockers if value not in ('candidates', 'unknown_candidates')]
+        snapshot['coverage']['scope_inventory_complete'] = not blockers
+        snapshot['coverage']['detail_coverage_complete'] = not blockers
+        snapshot['coverage']['pipe_slope_detail_coverage_complete'] = not blockers
+        snapshot['coverage']['detail_batch_size'] = min(500, self.control.limits['candidates'])
+        snapshot['coverage']['candidates_limit_basis'] = 'PER_FAST_DETAIL_BATCH' if self.control.mode == 'FAST' else 'TOTAL_RETAINED'
+        snapshot['coverage']['snapshot_identity'] = 'REQUIRES_SAVED_SOURCE_QUALIFICATION'
+        snapshot['coverage']['mirror_readiness'] = 'UNRESOLVED'
+        snapshot['coverage']['expected_absences'] = dict(self.expected_absences)
+        snapshot['coverage']['fast_omissions'] = (dict(
+            connector_topology=dict(status='NOT_INSPECTED_FAST', elements=len(selected)),
+            detailed_parameters_family_system_dependencies=dict(status='NOT_INSPECTED_FAST', elements=len(selected)),
+            architectural_links=dict(status='NOT_INSPECTED_FAST')) if self.control.mode == 'FAST' else {})
+        snapshot['coverage']['scope_inventory_basis'] = 'SUPPORTED_18_CATEGORIES_ONLY; conservative bbox/linear-curve classification'
+        snapshot['coverage']['detail_and_slope_basis'] = 'RETAINED_NON_OUTSIDE_RECORDS_ONLY; see classification ledger and limits'
+        snapshot['coverage']['baseline_comparison'] = 'PENDING_EXACT_DOCUMENT_AND_SNAPSHOT_EVIDENCE'
+        snapshot['elements'].sort(key=lambda row: row['key'])
+        snapshot['coverage']['architectural_links'] = 'NOT_INSPECTED_FAST' if self.control.mode == 'FAST' else 'BOUNDED'
+        self.control.check()
+        return snapshot

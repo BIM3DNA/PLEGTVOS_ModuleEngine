@@ -171,7 +171,7 @@ class StaticSafetyTests(unittest.TestCase):
             'SetElementIds','MirrorElements','MirrorElement','MoveElement','MoveElements','RotateElement',
             'CopyElements','CopyElement','Delete','Create','Save','SaveAs','SynchronizeWithCentral',
             'ConnectTo','DisconnectFrom','OpenDocumentFile','Close','HideElements','IsolateElementsTemporary'))
-        for name in ('script.py','revit_reader.py','diagnostic_core.py','report_store.py','failure_diagnostics.py'):
+        for name in ('script.py','revit_reader.py','diagnostic_core.py','report_store.py','failure_diagnostics.py','execution_control.py','snapshot_guard.py','detail_batches.py'):
             with open(os.path.join(BUTTON,name),'rb') as f: tree=ast.parse(f.read())
             for node in ast.walk(tree):
                 if isinstance(node,ast.Call):

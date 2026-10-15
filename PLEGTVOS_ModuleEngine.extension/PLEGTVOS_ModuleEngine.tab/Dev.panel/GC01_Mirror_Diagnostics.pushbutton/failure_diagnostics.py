@@ -45,3 +45,8 @@ def emit(lines):
     for line in lines:
         # Render again at the actual console boundary; only ASCII reaches stdout.
         sys.stdout.write(display(line) + '\n')
+
+    try:
+        sys.stdout.flush()
+    except Exception:
+        pass  # Some pyRevit output streams do not implement flushing.
